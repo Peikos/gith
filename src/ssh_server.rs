@@ -126,4 +126,63 @@ impl Handler for GithSession {
 
         handle_command(command, channel, ctx).await
     }
+
+    async fn pty_request(
+        &mut self,
+        channel_id: ChannelId,
+        _term: &str,
+        _width_px: u32,
+        _height_px: u32,
+        _width_rows: u32,
+        _height_rows: u32,
+        _modes: &[(russh::Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        info!("rejecting pty request on channel {}", channel_id);
+        let _ = session.channel_failure(channel_id);
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel_id: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        info!("handling shell request on channel {} as usage query", channel_id);
+
+        let channel = {
+            let mut channels = self.channels.lock().await;
+            channels.remove(&channel_id)
+        };
+
+        let Some(channel) = channel else {
+            let _ = session.channel_failure(channel_id);
+            return Ok(());
+        };
+
+        let handle = session.handle();
+
+        let usage = match self.authenticated_user {
+            Some(ref user) => format!(
+                "gith SSH server\n\nHello, {}. Available commands:\n\
+                 - register <token> <name>   (only before registration)\n\
+                 - list                     (list repositories)\n\
+                 - git-upload-pack <repo>   (git fetch/clone)\n\
+                 - git-receive-pack <repo>  (git push)\n",
+                user.name
+            ),
+            None => "gith SSH server\n\nYou are not registered yet.\n\
+                     Available command:\n\
+                     - register <token> <name>\n"
+                .to_string(),
+        };
+
+        let _ = handle.channel_success(channel_id).await;
+        let _ = channel.data(usage.as_bytes()).await;
+        let _ = handle.eof(channel_id).await;
+        let _ = handle.exit_status_request(channel_id, 0).await;
+        let _ = handle.close(channel_id).await;
+
+        Ok(())
+    }
 }
