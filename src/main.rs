@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gith::config::Config;
-use gith::db::{add_teacher, create_registration_token, init_db, open_db};
+use gith::db::{add_user, init_db, open_db};
 use gith::ssh_server::GithSshServer;
 use russh::server::Server as _;
 use tracing::{error, info};
@@ -27,7 +27,7 @@ enum Commands {
     Admin(AdminCommands),
 
     Server {
-        #[arg(short='H', long, default_value = "127.0.0.1")]
+        #[arg(short = 'H', long, default_value = "127.0.0.1")]
         host: String,
         #[arg(short, long, default_value_t = 2222)]
         port: u16,
@@ -42,10 +42,6 @@ enum AdminCommands {
         name: String,
         #[arg(short, long)]
         key: String,
-    },
-    CreateToken {
-        #[arg(short, long)]
-        teacher_id: i64,
     },
 }
 
@@ -70,15 +66,8 @@ async fn main() -> Result<()> {
                 config.ensure_dirs()?;
                 let conn = open_db(&config.db_path())?;
                 init_db(&conn)?;
-                let id = add_teacher(&conn, &name, &key)?;
-                info!("added teacher '{}' with id {}", name, id);
-            }
-            AdminCommands::CreateToken { teacher_id } => {
-                config.ensure_dirs()?;
-                let conn = open_db(&config.db_path())?;
-                init_db(&conn)?;
-                let token = create_registration_token(&conn, teacher_id)?;
-                println!("{}", token);
+                let id = add_user(&conn, &name, &key)?;
+                info!("added user '{}' with id {}", name, id);
             }
         },
         Commands::Server { host, port } => {

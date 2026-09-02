@@ -35,7 +35,7 @@ impl Server for GithSshServer {
 pub struct GithSession {
     config: Config,
     authenticated_user: Option<User>,
-    pending_public_key: Option<russh::keys::ssh_key::PublicKey>,
+    public_key: Option<russh::keys::ssh_key::PublicKey>,
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
 }
 
@@ -44,7 +44,7 @@ impl GithSession {
         Self {
             config,
             authenticated_user: None,
-            pending_public_key: None,
+            public_key: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -67,6 +67,7 @@ impl Handler for GithSession {
                     db_user.name, fingerprint
                 );
                 self.authenticated_user = Some(db_user);
+                self.public_key = Some(public_key.clone());
                 Ok(Auth::Accept)
             }
             Ok(None) => {
@@ -74,7 +75,7 @@ impl Handler for GithSession {
                     "public key auth accepted for unregistered user {} ({})",
                     user, fingerprint
                 );
-                self.pending_public_key = Some(public_key.clone());
+                self.public_key = Some(public_key.clone());
                 Ok(Auth::Accept)
             }
             Err(e) => {
@@ -115,11 +116,11 @@ impl Handler for GithSession {
             return Ok(());
         };
 
-        let pending_key = self.pending_public_key.clone();
+        let pending_key = self.public_key.clone();
         let ctx = CommandContext {
             config: self.config.clone(),
             authenticated_user: self.authenticated_user.clone(),
-            pending_public_key: pending_key,
+            public_key: pending_key,
             channel_id,
             handle: session.handle(),
         };
@@ -148,7 +149,10 @@ impl Handler for GithSession {
         channel_id: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!("handling shell request on channel {} as usage query", channel_id);
+        info!(
+            "handling shell request on channel {} as usage query",
+            channel_id
+        );
 
         let channel = {
             let mut channels = self.channels.lock().await;

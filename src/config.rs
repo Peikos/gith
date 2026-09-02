@@ -24,8 +24,25 @@ impl Config {
         self.data_dir.join("repos")
     }
 
-    pub fn user_repo_path(&self, user_id: i64) -> PathBuf {
-        self.repos_dir().join(user_id.to_string()).join("repo.git")
+    pub fn classroom_template_path(&self, classroom_slug: &str, repo_name: &str) -> PathBuf {
+        self.repos_dir()
+            .join(classroom_slug)
+            .join(repo_name)
+            .with_extension("git")
+    }
+
+    pub fn student_repo_path(
+        &self,
+        classroom_slug: &str,
+        repo_name: &str,
+        user_id: i64,
+    ) -> PathBuf {
+        self.repos_dir()
+            .join(classroom_slug)
+            .join(repo_name)
+            .join("students")
+            .join(user_id.to_string())
+            .with_extension("git")
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
