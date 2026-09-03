@@ -3,7 +3,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use russh::server::Handle;
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId, ChannelMsg, CryptoVec};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
@@ -15,6 +15,7 @@ use crate::db::{
     list_classroom_templates, list_user_memberships, open_db, set_membership_active,
 };
 
+#[derive(Clone)]
 pub struct CommandContext {
     pub config: Config,
     pub authenticated_user: Option<User>,
@@ -750,21 +751,6 @@ async fn classroom_download(
         .map(|(u, _)| u)
         .collect::<Vec<_>>();
 
-    if active_students.is_empty() {
-        ctx.handle
-            .channel_success(ctx.channel_id)
-            .await
-            .map_err(|_| anyhow::anyhow!("failed to send channel success"))?;
-        send_stderr(&ctx, "no active students to archive\n").await?;
-        send_exit(&ctx, 1).await?;
-        return Ok(());
-    }
-
-    ctx.handle
-        .channel_success(ctx.channel_id)
-        .await
-        .map_err(|_| anyhow::anyhow!("failed to send channel success"))?;
-
     let students_dir = ctx
         .config
         .repos_dir()
@@ -772,38 +758,153 @@ async fn classroom_download(
         .join(repo_name)
         .join("students");
 
-    let mut tar = tokio::process::Command::new("tar");
-    tar.arg("cz").arg("-C").arg(&students_dir);
+    // Only include students whose repositories actually exist.
+    let mut archive_entries: Vec<(std::path::PathBuf, String)> = Vec::new();
     for student in &active_students {
-        tar.arg(format!("{}.git", student.id));
-    }
-    tar.stdout(Stdio::piped());
-    let mut child = tar.spawn().context("spawning tar")?;
-    let mut stdout = child.stdout.take().unwrap();
-
-    let mut buf = [0u8; 8192];
-    loop {
-        match stdout.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                channel
-                    .data(&buf[..n])
-                    .await
-                    .map_err(|_| anyhow::anyhow!("failed to send archive data"))?;
-            }
-            Err(e) => {
-                warn!("tar read error: {}", e);
-                break;
-            }
+        let repo_path = students_dir.join(format!("{}.git", student.id));
+        if repo_path.is_dir() {
+            archive_entries.push((repo_path, student.name.replace(' ', "")));
+        } else {
+            info!(
+                "skipping student {} (id {}): repo {:?} does not exist",
+                student.name, student.id, repo_path
+            );
         }
     }
 
-    let status = child.wait().await.context("waiting for tar")?;
-    let exit_code = status.code().unwrap_or(1) as u32;
+    if archive_entries.is_empty() {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(&ctx, "no active student repositories found to archive\n").await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
+
+    // Offload the rest onto a separate task. The handler that called this runs
+    // on russh's session task; doing blocking/streaming work here would prevent
+    // that task from reading the socket, processing window updates and flushing
+    // outgoing data, which deadlocks large transfers.
+    let slug = slug.clone();
+    let repo_name = repo_name.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            classroom_download_send(slug, repo_name, channel, ctx, archive_entries).await
+        {
+            warn!("classroom download send task failed: {:#}", e);
+        }
+    });
+
+    Ok(())
+}
+
+async fn classroom_download_send(
+    slug: String,
+    repo_name: String,
+    mut channel: Channel<russh::server::Msg>,
+    ctx: CommandContext,
+    archive_entries: Vec<(std::path::PathBuf, String)>,
+) -> Result<()> {
     ctx.handle
-        .exit_status_request(ctx.channel_id, exit_code)
+        .channel_success(ctx.channel_id)
         .await
-        .map_err(|_| anyhow::anyhow!("failed to send exit status"))?;
+        .map_err(|_| anyhow::anyhow!("failed to send channel success"))?;
+    info!(
+        "download for {}/{}: channel_success sent, building archive for {} repo(s)",
+        slug,
+        repo_name,
+        archive_entries.len()
+    );
+
+    let archive = match tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        {
+            let encoder = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            for (repo_path, sanitized_name) in archive_entries {
+                builder
+                    .append_dir_all(format!("{}.git", sanitized_name), &repo_path)
+                    .with_context(|| format!("adding {:?} to archive", repo_path))?;
+            }
+            builder.finish().context("finalizing tar archive")?;
+        }
+        Ok(buf)
+    })
+    .await
+    {
+        Ok(Ok(archive)) => archive,
+        Ok(Err(e)) => {
+            send_stderr(&ctx, &format!("failed to build archive: {:#}\n", e)).await?;
+            send_exit(&ctx, 1).await?;
+            return Ok(());
+        }
+        Err(e) => {
+            send_stderr(&ctx, &format!("archive build task panicked: {}\n", e)).await?;
+            send_exit(&ctx, 1).await?;
+            return Ok(());
+        }
+    };
+
+    info!(
+        "download for {}/{}: sending archive of {} bytes",
+        slug,
+        repo_name,
+        archive.len()
+    );
+
+    // Stream the archive through a raw Channel writer. A separate drain task
+    // consumes *all* messages from the channel receiver (including window
+    // adjustments and EOF) so russh's session task never blocks trying to push
+    // control messages into a full channel while we are sending data.
+    let mut channel_write = channel.make_writer();
+    tokio::spawn(async move {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Eof) | None => break,
+                Some(_) => {}
+            }
+        }
+    });
+
+    let mut reader = std::io::Cursor::new(archive);
+    let mut buf = [0u8; 8192];
+    let mut total = 0usize;
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                warn!("archive read error: {}", e);
+                send_stderr(&ctx, "failed to read archive data\n").await?;
+                send_exit(&ctx, 1).await?;
+                return Ok(());
+            }
+        };
+
+        if let Err(e) = channel_write.write_all(&buf[..n]).await {
+            warn!("archive write error after {} bytes: {}", total, e);
+            send_stderr(&ctx, "failed to stream archive data\n").await?;
+            send_exit(&ctx, 1).await?;
+            return Ok(());
+        }
+        if let Err(e) = channel_write.flush().await {
+            warn!("archive flush error after {} bytes: {}", total, e);
+            send_stderr(&ctx, "failed to flush archive data\n").await?;
+            send_exit(&ctx, 1).await?;
+            return Ok(());
+        }
+
+        total += n;
+        info!(
+            "download for {}/{}: sent chunk of {} bytes (total {})",
+            slug, repo_name, n, total
+        );
+    }
+
+    if let Err(e) = channel_write.shutdown().await {
+        warn!("channel shutdown error: {}", e);
+    }
+
+    info!("download for {}/{}: archive stream closed", slug, repo_name);
+    send_exit(&ctx, 0).await?;
     Ok(())
 }
 

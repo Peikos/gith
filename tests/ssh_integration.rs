@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use gith::config::Config;
 use gith::db::{add_user, init_db, open_db};
 use gith::ssh_server::GithSshServer;
+use rand::RngCore;
 use russh::server::Server as _;
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -110,6 +111,110 @@ async fn run_ssh(port: u16, key: &std::path::Path, args: &[&str]) -> Result<(Str
     Ok((stdout, stderr))
 }
 
+async fn register_and_push_student(
+    port: u16,
+    token: &str,
+    key: &std::path::Path,
+    data_dir: &std::path::Path,
+    first_name: &str,
+    last_name: &str,
+    clone_dir_name: &str,
+) -> Result<PathBuf> {
+    let name = format!("{} {}", first_name, last_name);
+    let (register_out, register_err) =
+        run_ssh(port, key, &["register", token, first_name, last_name]).await?;
+    assert!(
+        register_out.contains(&format!("Welcome, {}", name)),
+        "unexpected register response for {}: stdout={} stderr={}",
+        name,
+        register_out,
+        register_err
+    );
+
+    let clone_dir = data_dir.join(clone_dir_name);
+    let ssh = git_ssh_command(key, port);
+    let mut clone = Command::new("git");
+    clone
+        .env("GIT_SSH_COMMAND", &ssh)
+        .arg("clone")
+        .arg(repo_url(port, "cs101", "lab1"))
+        .arg(&clone_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = clone
+        .output()
+        .await
+        .with_context(|| format!("cloning {}'s repo", name))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{} clone failed: stdout={} stderr={}",
+        name,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut branch = Command::new("git");
+    branch.arg("-C").arg(&clone_dir).arg("branch").arg("-a");
+    let output = branch.output().await?;
+    let branches = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        branches.contains("main"),
+        "{} missing main branch: {}",
+        name,
+        branches
+    );
+    assert!(
+        branches.contains("upstream"),
+        "{} missing upstream branch: {}",
+        name,
+        branches
+    );
+
+    tokio::fs::write(clone_dir.join("answer.txt"), "42\n").await?;
+
+    // Use incompressible data so the resulting archive is large enough to
+    // exercise the bulk-transfer code path (> 73 KB).
+    let mut noise = vec![0u8; 100_000];
+    rand::thread_rng().fill_bytes(&mut noise);
+    tokio::fs::write(clone_dir.join("large.bin"), noise).await?;
+
+    let mut add = Command::new("git");
+    add.arg("-C").arg(&clone_dir).arg("add").arg(".");
+    let output = add.output().await?;
+    anyhow::ensure!(output.status.success(), "{} git add failed", name);
+
+    let mut commit = Command::new("git");
+    commit
+        .arg("-C")
+        .arg(&clone_dir)
+        .arg("commit")
+        .arg("-m")
+        .arg("answer");
+    let output = commit.output().await?;
+    anyhow::ensure!(output.status.success(), "{} git commit failed", name);
+
+    let mut push = Command::new("git");
+    push.env("GIT_SSH_COMMAND", &ssh)
+        .arg("-C")
+        .arg(&clone_dir)
+        .arg("push")
+        .arg("origin")
+        .arg("main");
+    let output = push
+        .output()
+        .await
+        .with_context(|| format!("pushing {}'s repo", name))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{} push failed: stdout={} stderr={}",
+        name,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    Ok(clone_dir)
+}
+
 #[tokio::test]
 async fn test_classroom_git_round_trip() -> Result<()> {
     let data_dir = test_data_dir();
@@ -124,9 +229,11 @@ async fn test_classroom_git_round_trip() -> Result<()> {
     let teacher_pubkey = read_public_key(&teacher_key)?;
     add_user(&conn, "Teacher", &teacher_pubkey)?;
 
-    // Student key.
+    // Student keys.
     let student_key = data_dir.join("student_key");
     generate_key(&student_key)?;
+    let student2_key = data_dir.join("student2_key");
+    generate_key(&student2_key)?;
 
     // Start server.
     let (_server_handle, port) = start_server(config).await?;
@@ -208,7 +315,7 @@ async fn test_classroom_git_round_trip() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Teacher creates a student invite token.
+    // Teacher creates a reusable student invite token.
     let (token, _) = run_ssh(
         port,
         &teacher_key,
@@ -217,83 +324,27 @@ async fn test_classroom_git_round_trip() -> Result<()> {
     .await?;
     let token = token.trim();
 
-    // Student registers with a full name.
-    let (register_out, register_err) =
-        run_ssh(port, &student_key, &["register", token, "Alice", "Smith"]).await?;
-    assert!(
-        register_out.contains("Welcome, Alice Smith"),
-        "unexpected register response: stdout={} stderr={}",
-        register_out,
-        register_err
-    );
-
-    // Student clones the assignment URL and gets their own repo.
-    let student_clone = data_dir.join("student-clone");
-    let student_ssh = git_ssh_command(&student_key, port);
-    let mut clone = Command::new("git");
-    clone
-        .env("GIT_SSH_COMMAND", &student_ssh)
-        .arg("clone")
-        .arg(repo_url(port, "cs101", "lab1"))
-        .arg(&student_clone)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = clone.output().await.context("cloning student repo")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "student clone failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Verify the student repo has both main and upstream branches.
-    let mut branch = Command::new("git");
-    branch.arg("-C").arg(&student_clone).arg("branch").arg("-a");
-    let output = branch.output().await?;
-    let branches = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        branches.contains("main"),
-        "missing main branch: {}",
-        branches
-    );
-    assert!(
-        branches.contains("upstream"),
-        "missing upstream branch: {}",
-        branches
-    );
-
-    // Student pushes a commit.
-    tokio::fs::write(student_clone.join("answer.txt"), "42\n").await?;
-
-    let mut add = Command::new("git");
-    add.arg("-C").arg(&student_clone).arg("add").arg(".");
-    let output = add.output().await?;
-    anyhow::ensure!(output.status.success(), "student git add failed");
-
-    let mut commit = Command::new("git");
-    commit
-        .arg("-C")
-        .arg(&student_clone)
-        .arg("commit")
-        .arg("-m")
-        .arg("answer");
-    let output = commit.output().await?;
-    anyhow::ensure!(output.status.success(), "student git commit failed");
-
-    let mut push = Command::new("git");
-    push.env("GIT_SSH_COMMAND", &student_ssh)
-        .arg("-C")
-        .arg(&student_clone)
-        .arg("push")
-        .arg("origin")
-        .arg("main");
-    let output = push.output().await.context("pushing student repo")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "student push failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // Register and push work for two students in parallel, using the same invite token.
+    let (student_clone, _student2_clone) = tokio::try_join!(
+        register_and_push_student(
+            port,
+            token,
+            &student_key,
+            &data_dir,
+            "Alice",
+            "Smith",
+            "student-clone"
+        ),
+        register_and_push_student(
+            port,
+            token,
+            &student2_key,
+            &data_dir,
+            "Bob",
+            "Smith",
+            "student2-clone"
+        )
+    )?;
 
     // Teacher clones the student's repository by username.
     let teacher_student_clone = data_dir.join("teacher-student-clone");
@@ -366,7 +417,7 @@ async fn test_classroom_git_round_trip() -> Result<()> {
     // Student fetches and sees the new upstream commit.
     let mut fetch = Command::new("git");
     fetch
-        .env("GIT_SSH_COMMAND", &student_ssh)
+        .env("GIT_SSH_COMMAND", git_ssh_command(&student_key, port))
         .arg("-C")
         .arg(&student_clone)
         .arg("fetch")
@@ -407,8 +458,13 @@ async fn test_classroom_git_round_trip() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!output.stdout.is_empty(), "download produced empty archive");
+    assert!(
+        output.stdout.len() > 73_728,
+        "download archive is too small ({} bytes); should exercise the bulk-transfer path",
+        output.stdout.len()
+    );
 
-    // Verify the archive can be listed by tar.
+    // Verify the archive can be listed by tar and contains both students.
     let mut list = Command::new("tar");
     list.arg("tz")
         .stdin(Stdio::piped())
@@ -426,24 +482,36 @@ async fn test_classroom_git_round_trip() -> Result<()> {
     );
     let listing = String::from_utf8_lossy(&output.stdout);
     assert!(
-        listing.contains(".git/"),
-        "archive listing missing repos: {}",
+        listing.contains("AliceSmith.git/"),
+        "archive listing missing Alice's repo: {}",
+        listing
+    );
+    assert!(
+        listing.contains("BobSmith.git/"),
+        "archive listing missing Bob's repo: {}",
         listing
     );
 
-    // Teacher deactivates the student.
+    // Teacher deactivates both students.
     run_ssh(
         port,
         &teacher_key,
         &["classroom", "deactivate", "cs101", "2"],
     )
     .await?;
+    run_ssh(
+        port,
+        &teacher_key,
+        &["classroom", "deactivate", "cs101", "3"],
+    )
+    .await?;
 
-    // Listing active students should no longer include Alice.
+    // Listing should show both students as inactive now.
     let (list_out, _) = run_ssh(port, &teacher_key, &["classroom", "list", "cs101"]).await?;
-    assert!(
-        list_out.contains("active: no"),
-        "deactivated student not reflected in listing: {}",
+    assert_eq!(
+        list_out.matches("active: no").count(),
+        2,
+        "deactivated students not reflected in listing: {}",
         list_out
     );
 

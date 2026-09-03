@@ -10,6 +10,8 @@ dirs = "6"
 rand = "0.8"
 rusqlite = { version = "0.34", features = ["bundled"] }
 shlex = "1"
+tar = "0.4"
+flate2 = "1"
 russh = "0.50"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
