@@ -128,7 +128,23 @@ impl Handler for GithSession {
             handle: session.handle(),
         };
 
-        handle_command(command, channel, ctx).await
+        // Run the command off russh's session task. The session task must stay
+        // responsive to drain its internal event queue (capacity
+        // `event_buffer_size`, 10 by default), process window updates, and
+        // flush outgoing data. A handler that queues more than a few messages
+        // while running on the session task fills that queue and deadlocks the
+        // connection, since nothing can drain it until the handler returns.
+        tokio::spawn(async move {
+            if let Err(e) = handle_command(command, channel, ctx.clone()).await {
+                warn!("command handling failed: {:#}", e);
+                let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+                let _ = ctx.handle.exit_status_request(ctx.channel_id, 1).await;
+                let _ = ctx.handle.eof(ctx.channel_id).await;
+                let _ = ctx.handle.close(ctx.channel_id).await;
+            }
+        });
+
+        Ok(())
     }
 
     async fn pty_request(

@@ -777,19 +777,15 @@ async fn classroom_download(
         return Ok(());
     }
 
-    // Offload the rest onto a separate task. The handler that called this runs
-    // on russh's session task; doing blocking/streaming work here would prevent
-    // that task from reading the socket, processing window updates and flushing
-    // outgoing data, which deadlocks large transfers.
+    // The archive build and streaming happen in `classroom_download_send`.
+    // Command handling already runs off russh's session task (see
+    // `exec_request`), so russh stays responsive to window updates and can
+    // flush outgoing data while the archive streams.
     let slug = slug.clone();
     let repo_name = repo_name.clone();
-    tokio::spawn(async move {
-        if let Err(e) =
-            classroom_download_send(slug, repo_name, channel, ctx, archive_entries).await
-        {
-            warn!("classroom download send task failed: {:#}", e);
-        }
-    });
+    if let Err(e) = classroom_download_send(slug, repo_name, channel, ctx, archive_entries).await {
+        warn!("classroom download send failed: {:#}", e);
+    }
 
     Ok(())
 }
@@ -1160,10 +1156,11 @@ async fn send_stderr(ctx: &CommandContext, msg: &str) -> Result<()> {
 }
 
 async fn send_exit(ctx: &CommandContext, code: u32) -> Result<()> {
-    let _ = ctx.handle.eof(ctx.channel_id).await;
     ctx.handle
         .exit_status_request(ctx.channel_id, code)
         .await
         .map_err(|_| anyhow::anyhow!("failed to send exit status"))?;
+    let _ = ctx.handle.eof(ctx.channel_id).await;
+    let _ = ctx.handle.close(ctx.channel_id).await;
     Ok(())
 }
