@@ -3,7 +3,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use russh::server::Handle;
-use russh::{Channel, ChannelId, ChannelMsg, CryptoVec};
+use russh::{Channel, ChannelId, ChannelMsg};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
@@ -170,9 +170,7 @@ async fn run_git_command(
             match child_stderr.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = handle
-                        .extended_data(channel_id, 1, CryptoVec::from_slice(&buf[..n]))
-                        .await;
+                    let _ = handle.extended_data(channel_id, 1, buf[..n].to_vec()).await;
                 }
                 Err(e) => {
                     warn!("stderr read error: {}", e);
@@ -1155,7 +1153,7 @@ async fn update_upstream_ref(student_repo: &std::path::Path, src_ref: &str) -> R
 
 async fn send_stderr(ctx: &CommandContext, msg: &str) -> Result<()> {
     ctx.handle
-        .extended_data(ctx.channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
+        .extended_data(ctx.channel_id, 1, msg.as_bytes().to_vec())
         .await
         .map_err(|_| anyhow::anyhow!("failed to send stderr"))?;
     Ok(())

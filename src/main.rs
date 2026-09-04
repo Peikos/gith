@@ -109,7 +109,7 @@ fn load_or_generate_host_key(path: &std::path::Path) -> Result<russh::keys::Priv
             .with_context(|| format!("parsing host key from {:?}", path))
     } else {
         let key = russh::keys::PrivateKey::random(
-            &mut rand::thread_rng(),
+            &mut rand::rng(),
             russh::keys::ssh_key::Algorithm::Ed25519,
         )
         .context("generating host key")?;

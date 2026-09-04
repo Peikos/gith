@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rand::RngCore;
+use rand::Rng;
 use rusqlite::{Connection, OptionalExtension};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,7 +723,7 @@ pub fn compute_fingerprint(key: &russh::keys::ssh_key::PublicKey) -> String {
 
 fn generate_token() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut bytes = [0u8; 32];
     rng.fill_bytes(&mut bytes);
     bytes

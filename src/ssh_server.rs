@@ -82,6 +82,7 @@ impl Handler for GithSession {
                 warn!("database error during auth: {:#}", e);
                 Ok(Auth::Reject {
                     proceed_with_methods: None,
+                    partial_success: false,
                 })
             }
         }
@@ -90,11 +91,13 @@ impl Handler for GithSession {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: russh::ChannelOpenHandleInner<Msg>,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
         let id = channel.id();
         self.channels.lock().await.insert(id, channel);
-        Ok(true)
+        Ok(())
     }
 
     async fn exec_request(

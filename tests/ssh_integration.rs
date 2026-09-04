@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use gith::config::Config;
 use gith::db::{add_user, init_db, open_db};
 use gith::ssh_server::GithSshServer;
-use rand::RngCore;
+use rand::Rng;
 use russh::server::Server as _;
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -54,7 +54,7 @@ async fn start_server(
         auth_rejection_time: Duration::from_secs(1),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
         keys: vec![russh::keys::PrivateKey::random(
-            &mut rand::thread_rng(),
+            &mut rand::rng(),
             russh::keys::ssh_key::Algorithm::Ed25519,
         )?],
         ..Default::default()
@@ -175,7 +175,7 @@ async fn register_and_push_student(
     // Use incompressible data so the resulting archive is large enough to
     // exercise the bulk-transfer code path (> 73 KB).
     let mut noise = vec![0u8; 100_000];
-    rand::thread_rng().fill_bytes(&mut noise);
+    rand::rng().fill_bytes(&mut noise);
     tokio::fs::write(clone_dir.join("large.bin"), noise).await?;
 
     let mut add = Command::new("git");
