@@ -11,22 +11,7 @@ title = "Gith"
 
 ## Docenten
 
-### Initialisatie
-
-De eerste initialisatie vindt plaats via de command line; zodra de server draait is deze via SSH te benaderen om configuratiestappen uit te voeren en voor het serven van de Git repositories.
-
-```bash
-# Eenmalig
-gith admin init
-gith -- admin add-teacher --name "Brian van der Bijl" --key "$(cat ~/.ssh/id_ed25519.pub)"
-
-# Starten server (kan idealiter in een `systemd` of vergelijkbaar systeem gemanaged worden - start at boot).
-gith server --host 0.0.0.0 --port 22
-```
-
-Nu de server draait kan de rest via SSH gebeuren. Hier wordt SSH niet gebruikt om in te loggen op een shell (bash en dergelijke), maar om direct de server aan te sturen. Om een commando uit te voeren dien je geauthoriseerd te zijn, op dit moment is dit alleen de eerste gebruiker. De server weet wie iemand is (en daarmee welke rechten iemand heeft) doordat er bij het maken van de verbinding een SSH key wordt gebruiket. Password login staat uit.
-
-De default data directory is `~/.local/share/gith`.
+Alle communicatie met de tool verloopt via SSH. Hier wordt SSH niet gebruikt om in te loggen op een interactieve shell (bash en dergelijke), maar om directe commando's naar de server te sturen. Om een commando uit te voeren dien je geauthoriseerd te zijn. De server weet wie iemand is (en daarmee welke rechten iemand heeft) doordat er bij het maken van de verbinding een SSH key wordt gebruikt.
 
 ### Classroom maken
 
@@ -114,11 +99,18 @@ Anderzijds neemt dit de noodzaak weg om voor iedere semester-iteratie een hele n
 
 ## Studenten
 
-Vanuit de student kant ziet de ervaring er vergelijkbaar uit. De student registreert zich met een via de docent (Canvas) verkregen token voor een classroom, en kan dan automatisch aan alle opdrachten daarbinnen deelnemen. Deze registratie vindt dus een keer per semester plaats (en kan bij herkansing worden overgeslagen). De enige benodigdheid van de student-kant is SSH (standaard op Mac en Linux, op Windows standaard meegeleverd met `git` via **Git Bash**) en een key (te maken met `ssh-keygen`):
+Vanuit de student kant ziet de ervaring er vergelijkbaar maar simpeler uit. De student registreert zich met een via de docent (Canvas) verkregen token voor een classroom, en kan dan automatisch aan alle opdrachten daarbinnen deelnemen. Deze registratie vindt dus &eacute;&eacute;n keer per semester plaats (en kan bij herkansing worden overgeslagen). De enige benodigdheid van de student-kant is SSH (standaard op Mac en Linux, op Windows standaard meegeleverd met `git` via **Git Bash**) en een key (te maken met `ssh-keygen`):
 
 ```bash
 ssh gith.athena.peikos.net register "$TOKEN" "Joris Heemskerk"
 ```
+
+Dit is het enige commando waarvoor de student een andere tool dan het `git` commando *moet* gebruiken, hierna verloopt het pullen en pushen van code via standaard `git` commando's. Optioneel kan de student (net als docenten) via `ssh` een overicht van hun repo's opvragen met `list`:
+
+```bash
+ssh gith.athena.peikos.net list
+```
+
 
 ### Clonen en pushen
 
@@ -133,12 +125,6 @@ git push origin main
 
 Wanneer ik als docent push naar de template wordt dit automatisch meegenomen voor studenten die nog niet aan de opdracht zijn begonnen. Als de student al werk heeft ingediend wanneer ik als docent een fix push, dan levert dit mogelijke conflicten op, dus dit wordt nadat een student is begonnen niet meer automatisch op de `main` branch meegenomen. In plaats daarvan is er een tweede `upstream` branch die een student kan binnenhalen met `git fetch` gevolgd door `git merge origin/upstream`.
 
-Tot slot kunnen studenten een overzicht van hun repo's zien met `list`:
-
-```bash
-ssh gith.athena.peikos.net list
-```
-
 ## Groepsprojecten
 Op dit moment nog niet meegenomen, toekomstige implementatie afhankelijk van animo. Dit zou een extra laag in het datamodel toevoegen (en daarmee instructies voor student en docent compliceren), en is mogelijk in strid met kerndoelen "hou het zo simpel mogelijk" en "doe liever een ding goed dan alle dingen matig".
 
@@ -146,4 +132,25 @@ Op dit moment nog niet meegenomen, toekomstige implementatie afhankelijk van ani
 Hier wel [SourceHut](https://sr.ht/)/[GitLab](https://about.gitlab.com/)/[GitHub](https://github.com/)/[Forgejo](https://forgejo.org/) voor gebruiken. Dit sluit aan op leerdoelen om een industry standard te gebruiken. Fundamenteel verschil tussen "tooling om code templating en inlevering te ondersteunen" en "ICT project draaien in realistische omgeving".
 
 ## Grasduinen
-Maak gerust een test-classroom aan en voeg jezelf als student of TA toe met een tweede ssh-key. `ssh-keygen` stelt je in staat extra keys te generen, en met de `-i` parameter van `ssh` kun je een alternatieve key kiezen.
+Als jij als collega het systeem wil verkennen / testen, vraag dan [Brian van der Bijl](mailto:brian.vanderbijl@hu.nl) om een teacher invite. Met deze invite kom je terecht in de `gith` classroom, die als een soort van lobby fungeert. Maak vanuit hier gerust een test-classroom aan en voeg daar templates aan toe. Het is prima mogelijk om jezelf (ook) als student of TA toe te voegen met een tweede ssh-key. `ssh-keygen` stelt je in staat extra keys te generen, en met de `-i` parameter van `ssh` kun je een alternatieve key kiezen.
+
+## Server Admin
+De stappen in deze sectie zijn eenmalig nodig, en niet van toepassing bij bestaande installatie.
+
+### Initialisatie
+
+De eerste initialisatie vindt plaats via de command line; zodra de server draait is deze via SSH te benaderen om configuratiestappen uit te voeren en voor het serven van de Git repositories.
+
+```bash
+# Eenmalig
+gith admin init
+gith -- admin add-teacher --name "Brian van der Bijl" --key "$(cat ~/.ssh/id_ed25519.pub)"
+
+# Starten server (kan idealiter in een `systemd` of vergelijkbaar systeem gemanaged worden - start at boot).
+gith server --host 0.0.0.0 --port 22
+```
+
+Nu de server draait kan de rest via SSH gebeuren. Op dit moment is er slechts een geauthoriseerde gebruiker, die tijdens de initialisatie is aangemaakt. Via SSH kunnen classrooms en users worden aangemaakt en rechten worden toegekend. Alle authenticatie en authorisatie gebeurt of basis van SSH keys; password login staat uit.
+
+De default data directory is `~/.local/share/gith`.
+
