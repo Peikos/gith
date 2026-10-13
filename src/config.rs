@@ -8,6 +8,8 @@ pub struct Config {
 }
 
 impl Config {
+    pub const DEFAULT_BRANCH: &str = "main";
+
     pub fn new(data_dir: Option<PathBuf>) -> Result<Self> {
         let data_dir = match data_dir {
             Some(d) => d,

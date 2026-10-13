@@ -100,10 +100,8 @@ async fn spawn_git(
             }
         }
 
-        if needs_upstream_sync {
-            if let Err(e) = sync_upstream_branch(&ctx, &repo_path).await {
-                warn!("upstream sync failed: {:#}", e);
-            }
+        if needs_upstream_sync && let Err(e) = sync_upstream_branch(&ctx, &repo_path).await {
+            warn!("upstream sync failed: {:#}", e);
         }
 
         if let Err(e) = run_git_command(subcommand, repo_path, channel, &ctx).await {
@@ -130,7 +128,90 @@ async fn create_bare_repo(repo_path: &std::path::Path) -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    // `git init` points HEAD at the local default branch (still `master` on
+    // many student systems), which would leave every clone with a dangling
+    // remote HEAD until that branch happens to be pushed. Assume `main`
+    // convention for teacher repo's (set in config::Config::DEFAULT_BRANCH).
+    set_repo_head(repo_path, &format!("refs/heads/{}", Config::DEFAULT_BRANCH)).await
+}
+
+async fn set_repo_head(repo_path: &std::path::Path, target: &str) -> Result<()> {
+    let output = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_path)
+        .arg("symbolic-ref")
+        .arg("HEAD")
+        .arg(target)
+        .output()
+        .await
+        .with_context(|| format!("setting HEAD of {:?} to {}", repo_path, target))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to set HEAD to {}: {}",
+            target,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Ok(())
+}
+
+/// Ensure a repository's HEAD points at a branch that actually exists.
+///
+/// Repositories created by older git (or seeded from a repo whose HEAD names
+/// an unborn branch) advertise a dangling remote HEAD, which makes clients
+/// warn about a nonexistent ref and clone an empty working tree — older
+/// clients then guess a branch name from their own `init.defaultBranch`.
+/// Repointing HEAD at an existing branch lets any client clone correctly
+/// regardless of its configuration.
+async fn ensure_repo_head(repo_path: &std::path::Path) -> Result<()> {
+    let output = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_path)
+        .arg("symbolic-ref")
+        .arg("-q")
+        .arg("HEAD")
+        .output()
+        .await
+        .with_context(|| format!("reading HEAD of {:?}", repo_path))?;
+    if !output.status.success() {
+        // Detached or missing HEAD; nothing sensible to repoint.
+        return Ok(());
+    }
+    let target = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !target.starts_with("refs/heads/") {
+        return Ok(());
+    }
+    if git_ref_exists(repo_path, &target).await? {
+        return Ok(());
+    }
+    for branch in ["main", "master"] {
+        let candidate = format!("refs/heads/{branch}");
+        if git_ref_exists(repo_path, &candidate).await? {
+            warn!(
+                "repo {:?}: HEAD pointed to unborn {}, repointing to {}",
+                repo_path, target, candidate
+            );
+            set_repo_head(repo_path, &candidate).await?;
+            return Ok(());
+        }
+    }
+    // Empty repository (no branches yet); make sure HEAD matches convention.
+    set_repo_head(repo_path, &format!("refs/heads/{}", Config::DEFAULT_BRANCH)).await?;
+    Ok(())
+}
+
+async fn git_ref_exists(repo_path: &std::path::Path, refname: &str) -> Result<bool> {
+    let output = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_path)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(refname)
+        .output()
+        .await
+        .with_context(|| format!("checking ref {} in {:?}", refname, repo_path))?;
+    Ok(output.status.success())
 }
 
 async fn run_git_command(
@@ -525,13 +606,13 @@ async fn classroom_add_template(
     create_classroom_template(&conn, classroom.id, repo_name).context("recording template")?;
 
     let template_path = ctx.config.classroom_template_path(slug, repo_name);
-    if !template_path.exists() {
-        if let Err(e) = create_bare_repo(&template_path).await {
-            let _ = ctx.handle.channel_failure(ctx.channel_id).await;
-            send_stderr(&ctx, &format!("failed to create template repo: {:#}\n", e)).await?;
-            send_exit(&ctx, 1).await?;
-            return Ok(());
-        }
+    if !template_path.exists()
+        && let Err(e) = create_bare_repo(&template_path).await
+    {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(&ctx, &format!("failed to create template repo: {:#}\n", e)).await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
     }
 
     ctx.handle
@@ -951,25 +1032,25 @@ async fn resolve_repo_path(
         anyhow::bail!("inactive members cannot push");
     }
 
-    match (target_user_id, membership.role) {
+    let (repo_path, needs_upstream_sync) = match (target_user_id, membership.role) {
         (None, Role::Teacher) => {
             // Teacher accessing /<classroom>/<repo>.git: the template repo.
-            Ok((
+            (
                 ctx.config
                     .classroom_template_path(classroom_slug, repo_name),
                 false,
-            ))
+            )
         }
         (None, Role::Ta) => {
             // TA can read the template.
             if is_write {
                 anyhow::bail!("TAs cannot push to templates");
             }
-            Ok((
+            (
                 ctx.config
                     .classroom_template_path(classroom_slug, repo_name),
                 false,
-            ))
+            )
         }
         (None, Role::Student) => {
             // Student accessing their own copy.
@@ -987,7 +1068,7 @@ async fn resolve_repo_path(
                     init_student_repo_from_template(&template_path, &student_repo).await?;
                 }
             }
-            Ok((student_repo, true))
+            (student_repo, true)
         }
         (Some(target_id), Role::Teacher) | (Some(target_id), Role::Ta) => {
             // Staff accessing a specific student's repo.
@@ -1000,16 +1081,23 @@ async fn resolve_repo_path(
             if target_membership.role != Role::Student {
                 anyhow::bail!("staff repo path only valid for student repositories");
             }
-            Ok((
+            (
                 ctx.config
                     .student_repo_path(classroom_slug, repo_name, target_id),
                 false,
-            ))
+            )
         }
         (Some(_), Role::Student) => {
             anyhow::bail!("students cannot access other students' repositories");
         }
-    }
+    };
+
+    // Repair repositories whose HEAD names an unborn branch (e.g. created
+    // before HEAD was set explicitly), so clients always see a valid remote
+    // HEAD regardless of their own default-branch configuration.
+    ensure_repo_head(&repo_path).await?;
+
+    Ok((repo_path, needs_upstream_sync))
 }
 
 async fn init_student_repo_from_template(
@@ -1039,6 +1127,7 @@ async fn init_student_repo_from_template(
     }
 
     sync_upstream_branch_inner(template_path, student_repo).await?;
+    ensure_repo_head(student_repo).await?;
     Ok(())
 }
 
@@ -1105,7 +1194,7 @@ async fn sync_upstream_branch_inner(
         if head_ref.starts_with("refs/remotes/template/") {
             head_ref
         } else {
-            "refs/remotes/template/main".to_string()
+            format!("refs/remotes/template/{}", Config::DEFAULT_BRANCH)
         }
     } else {
         // Fallback: try common default branches.

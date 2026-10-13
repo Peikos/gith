@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use gith::config::Config;
-use gith::db::{add_user, init_db, open_db};
+use gith::db::{add_user, find_user_by_sanitized_name, init_db, open_db};
 use gith::ssh_server::GithSshServer;
 use rand::Rng;
 use russh::server::Server as _;
@@ -442,6 +442,71 @@ async fn test_classroom_git_round_trip() -> Result<()> {
         upstream_log.contains("template update"),
         "origin/upstream missing template update: {}",
         upstream_log
+    );
+
+    // Simulate a student repository created by older git, whose HEAD names an
+    // unborn branch (the host git may already default to `main`, which would
+    // never produce this state on its own). A client whose default branch is
+    // still `master` used to get an empty clone with a warning here; the
+    // server must repoint HEAD at the branch that actually exists, so no
+    // client-side configuration is needed.
+    let alice = find_user_by_sanitized_name(&conn, "AliceSmith")?.context("alice not found")?;
+    let alice_repo = data_dir
+        .join("repos")
+        .join("cs101")
+        .join("lab1")
+        .join("students")
+        .join(alice.id.to_string())
+        .with_extension("git");
+    let mut break_head = Command::new("git");
+    break_head
+        .arg("--git-dir")
+        .arg(&alice_repo)
+        .arg("symbolic-ref")
+        .arg("HEAD")
+        .arg("refs/heads/master");
+    let output = break_head.output().await.context("breaking student HEAD")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to break student repo HEAD: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let legacy_clone = data_dir.join("legacy-clone");
+    let mut legacy = Command::new("git");
+    legacy
+        .env("GIT_SSH_COMMAND", git_ssh_command(&student_key, port))
+        .arg("-c")
+        .arg("init.defaultBranch=master")
+        .arg("clone")
+        .arg(repo_url(port, "cs101", "lab1"))
+        .arg(&legacy_clone)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = legacy.output().await.context("legacy client clone")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "legacy client clone failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut branch = Command::new("git");
+    branch
+        .arg("-C")
+        .arg(&legacy_clone)
+        .arg("branch")
+        .arg("--show-current");
+    let output = branch.output().await?;
+    let current_branch = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        current_branch.trim(),
+        "main",
+        "legacy client did not check out main"
+    );
+    anyhow::ensure!(
+        legacy_clone.join("answer.txt").is_file(),
+        "legacy client clone is missing the student's answer.txt"
     );
 
     // Teacher downloads an archive of active student repos.

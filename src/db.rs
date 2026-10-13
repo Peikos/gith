@@ -653,14 +653,14 @@ pub fn consume_classroom_invite_token(
     {
         Some(existing) => {
             // Update name if provided and different.
-            if let Some(new_name) = name {
-                if new_name != existing.name {
-                    tx.execute(
-                        "UPDATE users SET name = ?1 WHERE id = ?2",
-                        (new_name, existing.id),
-                    )
-                    .context("updating user name")?;
-                }
+            if let Some(new_name) = name
+                && new_name != existing.name
+            {
+                tx.execute(
+                    "UPDATE users SET name = ?1 WHERE id = ?2",
+                    (new_name, existing.id),
+                )
+                .context("updating user name")?;
             }
             existing
         }
