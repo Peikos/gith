@@ -54,6 +54,13 @@ git commit -m "Initial commit"
 git push -u origin main
 ```
 
+#### Branches
+De eerste branch die in een (template) repo wordt gepushed, wordt automatisch als "default" branch gezien - dit is de branch waar een studentversie op gebaseerd is en waar een `upstream` branch naar verwijst. Wanneer per ongeluk een verkeerde branch als eerste gepusht is, kan dit worden overschreven met het `set-default-branch`:
+
+```bash
+ssh gith.athena.peikos.net classroom set-default-branch ai-s2 api-requests main
+```
+
 ### Studenten (docenten/TAs) toevoegen via token
 
 Om mensen aan een bestaande classroom toe te voegen kan ik een invite maken worden. Dit gaat wederom op basis van classroom slug. Daarnaast moet een rol worden toegekend uit de set { `student`, `ta`, `teacher` }. Het resultaat is een base-64 token die met de invitees gedeeld kan worden om in te loggen, waarbij de rechten waarmee de token is aangemaakt worden toegekend aan de SSH key van de nieuwe teacher/ta/student.

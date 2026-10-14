@@ -80,7 +80,7 @@ async fn spawn_git(
 ) {
     tokio::spawn(async move {
         let repo_result = resolve_repo_path(&ctx, &repo_arg, subcommand == "receive-pack").await;
-        let (repo_path, needs_upstream_sync) = match repo_result {
+        let (repo_path, sync_template) = match repo_result {
             Ok(p) => p,
             Err(e) => {
                 let _ = ctx.handle.channel_failure(ctx.channel_id).await;
@@ -100,7 +100,9 @@ async fn spawn_git(
             }
         }
 
-        if needs_upstream_sync && let Err(e) = sync_upstream_branch(&ctx, &repo_path).await {
+        if let Some(ref template_path) = sync_template
+            && let Err(e) = sync_upstream_branch_inner(template_path, &repo_path).await
+        {
             warn!("upstream sync failed: {:#}", e);
         }
 
@@ -214,6 +216,68 @@ async fn git_ref_exists(repo_path: &std::path::Path, refname: &str) -> Result<bo
     Ok(output.status.success())
 }
 
+async fn list_branches(repo_path: &std::path::Path) -> Result<Vec<String>> {
+    let output = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_path)
+        .arg("for-each-ref")
+        .arg("--format=%(refname)")
+        .arg("refs/heads")
+        .output()
+        .await
+        .with_context(|| format!("listing branches of {:?}", repo_path))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to list branches: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Adopt the sole pushed branch as a repository's default branch.
+///
+/// When a repository's HEAD names an unborn branch (e.g. the configured
+/// default was never pushed) and exactly one branch exists — the typical
+/// result of a first push introducing a differently named branch — that
+/// branch becomes HEAD so subsequent clones check out real content. A HEAD
+/// that already points at an existing branch is never overridden.
+async fn adopt_pushed_branch_as_head(repo_path: &std::path::Path) -> Result<()> {
+    let output = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(repo_path)
+        .arg("symbolic-ref")
+        .arg("-q")
+        .arg("HEAD")
+        .output()
+        .await
+        .with_context(|| format!("reading HEAD of {:?}", repo_path))?;
+    if !output.status.success() {
+        return Ok(());
+    }
+    let target = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !target.starts_with("refs/heads/") {
+        return Ok(());
+    }
+    if git_ref_exists(repo_path, &target).await? {
+        return Ok(());
+    }
+    let branches = list_branches(repo_path).await?;
+    if branches.len() == 1 {
+        info!(
+            "repo {:?}: adopting {} as default branch after first push",
+            repo_path, branches[0]
+        );
+        set_repo_head(repo_path, &branches[0]).await?;
+    }
+    Ok(())
+}
+
 async fn run_git_command(
     subcommand: &str,
     repo_path: PathBuf,
@@ -284,6 +348,15 @@ async fn run_git_command(
         subcommand, exit_code, ctx.channel_id
     );
 
+    // A successful push may leave the repository's HEAD dangling (the pushed
+    // branch may not match the preconfigured default); if so, and a single
+    // branch now exists, adopt it as the default.
+    if subcommand == "receive-pack"
+        && exit_code == 0
+        && let Err(e) = adopt_pushed_branch_as_head(&repo_path).await
+    {
+        warn!("failed to adopt pushed branch as HEAD: {:#}", e);
+    }
     ctx.handle
         .exit_status_request(ctx.channel_id, exit_code)
         .await
@@ -421,6 +494,7 @@ async fn handle_classroom(
         "list" => classroom_list(parts, channel, ctx).await,
         "deactivate" => classroom_deactivate(parts, channel, ctx).await,
         "download" => classroom_download(parts, channel, ctx).await,
+        "set-default-branch" => classroom_set_default_branch(parts, channel, ctx).await,
         _ => {
             send_classroom_usage(&ctx).await?;
             Ok(())
@@ -436,7 +510,8 @@ async fn send_classroom_usage(ctx: &CommandContext) -> Result<()> {
                  - classroom add-template <slug> <repo-name>\n\
                  - classroom list <slug>\n\
                  - classroom deactivate <slug> <user-id>\n\
-                 - classroom download <slug> <repo-name>\n";
+                 - classroom download <slug> <repo-name>\n\
+                 - classroom set-default-branch <slug> <repo-name> <branch>\n";
     send_stderr(ctx, usage).await?;
     send_exit(ctx, 1).await?;
     Ok(())
@@ -621,6 +696,94 @@ async fn classroom_add_template(
         .map_err(|_| anyhow::anyhow!("failed to send channel success"))?;
     channel
         .data(format!("Added template {} to classroom {}.\n", repo_name, slug).as_bytes())
+        .await
+        .map_err(|_| anyhow::anyhow!("failed to send response"))?;
+    send_exit(&ctx, 0).await?;
+    Ok(())
+}
+
+async fn classroom_set_default_branch(
+    parts: Vec<String>,
+    channel: Channel<russh::server::Msg>,
+    ctx: CommandContext,
+) -> Result<()> {
+    if parts.len() < 5 {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(
+            &ctx,
+            "usage: classroom set-default-branch <slug> <repo-name> <branch>\n",
+        )
+        .await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
+
+    let slug = &parts[2];
+    let repo_name = &parts[3];
+    let branch = &parts[4];
+
+    let Some(ref user) = ctx.authenticated_user else {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(&ctx, "classroom set-default-branch requires registration\n").await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    };
+
+    let conn = open_db(&ctx.config.db_path())?;
+    let classroom = find_classroom_by_slug(&conn, slug)
+        .context("loading classroom")?
+        .context("classroom not found")?;
+
+    let membership =
+        find_classroom_membership(&conn, user.id, classroom.id).context("loading membership")?;
+
+    let can_manage = matches!(membership, Some(m) if m.role == Role::Teacher && m.active);
+
+    if !can_manage {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(
+            &ctx,
+            "only active classroom teachers can set the default branch\n",
+        )
+        .await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
+
+    find_classroom_template(&conn, classroom.id, repo_name)
+        .context("loading template")?
+        .context("template not found")?;
+
+    let template_path = ctx.config.classroom_template_path(slug, repo_name);
+    let branch_ref = format!("refs/heads/{branch}");
+    if !git_ref_exists(&template_path, &branch_ref).await? {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(
+            &ctx,
+            &format!(
+                "branch {} does not exist in template {}\n",
+                branch, repo_name
+            ),
+        )
+        .await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
+
+    set_repo_head(&template_path, &branch_ref).await?;
+
+    ctx.handle
+        .channel_success(ctx.channel_id)
+        .await
+        .map_err(|_| anyhow::anyhow!("failed to send channel success"))?;
+    channel
+        .data(
+            format!(
+                "Default branch of {} in classroom {} is now {}.\n",
+                repo_name, slug, branch
+            )
+            .as_bytes(),
+        )
         .await
         .map_err(|_| anyhow::anyhow!("failed to send response"))?;
     send_exit(&ctx, 0).await?;
@@ -987,7 +1150,7 @@ async fn resolve_repo_path(
     ctx: &CommandContext,
     repo_arg: &str,
     is_write: bool,
-) -> Result<(PathBuf, bool)> {
+) -> Result<(PathBuf, Option<PathBuf>)> {
     let path = repo_arg.trim_start_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -1032,13 +1195,16 @@ async fn resolve_repo_path(
         anyhow::bail!("inactive members cannot push");
     }
 
-    let (repo_path, needs_upstream_sync) = match (target_user_id, membership.role) {
+    // The second tuple element carries the template whose default branch a
+    // student's `upstream` branch mirrors; it is set only when the student
+    // accesses their own repository.
+    let (repo_path, sync_template) = match (target_user_id, membership.role) {
         (None, Role::Teacher) => {
             // Teacher accessing /<classroom>/<repo>.git: the template repo.
             (
                 ctx.config
                     .classroom_template_path(classroom_slug, repo_name),
-                false,
+                None,
             )
         }
         (None, Role::Ta) => {
@@ -1049,7 +1215,7 @@ async fn resolve_repo_path(
             (
                 ctx.config
                     .classroom_template_path(classroom_slug, repo_name),
-                false,
+                None,
             )
         }
         (None, Role::Student) => {
@@ -1060,15 +1226,13 @@ async fn resolve_repo_path(
             let student_repo = ctx
                 .config
                 .student_repo_path(classroom_slug, repo_name, user.id);
-            if !student_repo.exists() {
-                let template_path = ctx
-                    .config
-                    .classroom_template_path(classroom_slug, repo_name);
-                if template_path.exists() {
-                    init_student_repo_from_template(&template_path, &student_repo).await?;
-                }
+            let template_path = ctx
+                .config
+                .classroom_template_path(classroom_slug, repo_name);
+            if !student_repo.exists() && template_path.exists() {
+                init_student_repo_from_template(&template_path, &student_repo).await?;
             }
-            (student_repo, true)
+            (student_repo, Some(template_path))
         }
         (Some(target_id), Role::Teacher) | (Some(target_id), Role::Ta) => {
             // Staff accessing a specific student's repo.
@@ -1084,7 +1248,7 @@ async fn resolve_repo_path(
             (
                 ctx.config
                     .student_repo_path(classroom_slug, repo_name, target_id),
-                false,
+                None,
             )
         }
         (Some(_), Role::Student) => {
@@ -1097,7 +1261,7 @@ async fn resolve_repo_path(
     // HEAD regardless of their own default-branch configuration.
     ensure_repo_head(&repo_path).await?;
 
-    Ok((repo_path, needs_upstream_sync))
+    Ok((repo_path, sync_template))
 }
 
 async fn init_student_repo_from_template(
@@ -1131,23 +1295,6 @@ async fn init_student_repo_from_template(
     Ok(())
 }
 
-async fn sync_upstream_branch(ctx: &CommandContext, student_repo: &std::path::Path) -> Result<()> {
-    let path_str = student_repo.to_string_lossy();
-    let segments: Vec<&str> = path_str.split('/').collect();
-    // Path shape: .../repos/<slug>/<repo>/students/<id>.git
-    let len = segments.len();
-    if len < 5 {
-        anyhow::bail!("unexpected student repo path shape");
-    }
-    let classroom_slug = segments[len - 5];
-    let repo_name = segments[len - 4];
-    let template_path = ctx
-        .config
-        .classroom_template_path(classroom_slug, repo_name);
-
-    sync_upstream_branch_inner(&template_path, student_repo).await
-}
-
 async fn sync_upstream_branch_inner(
     template_path: &std::path::Path,
     student_repo: &std::path::Path,
@@ -1179,42 +1326,46 @@ async fn sync_upstream_branch_inner(
         );
     }
 
-    // Determine the default branch on the template remote.
+    // Determine the template's current default branch by reading its HEAD
+    // directly. The remote-tracking HEAD symref in the student repo is only
+    // guaranteed to be fresh at clone time, so resolving through
+    // `template/HEAD` could keep pointing at a branch the teacher has since
+    // replaced via `classroom set-default-branch`.
+    let default_branch = template_default_branch(template_path).await?;
+
+    // Unconditional update: the upstream branch always mirrors the tip of
+    // the template's default branch, even across divergence.
+    update_upstream_ref(
+        student_repo,
+        &format!("refs/remotes/template/{default_branch}"),
+    )
+    .await
+}
+
+/// Resolve the default branch of a template repository: its HEAD symref if it
+/// names a branch, else the conventional fallback branches.
+async fn template_default_branch(template_path: &std::path::Path) -> Result<String> {
     let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(student_repo)
-        .arg("rev-parse")
-        .arg("--symbolic-full-name")
-        .arg("template/HEAD")
+        .arg("--git-dir")
+        .arg(template_path)
+        .arg("symbolic-ref")
+        .arg("-q")
+        .arg("HEAD")
         .output()
         .await
         .context("resolving template HEAD")?;
-    let upstream_ref = if output.status.success() {
-        let head_ref = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if head_ref.starts_with("refs/remotes/template/") {
-            head_ref
-        } else {
-            format!("refs/remotes/template/{}", Config::DEFAULT_BRANCH)
+    if output.status.success() {
+        let target = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(branch) = target.strip_prefix("refs/heads/") {
+            return Ok(branch.to_string());
         }
-    } else {
-        // Fallback: try common default branches.
-        for branch in ["main", "master"] {
-            let output = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(student_repo)
-                .arg("rev-parse")
-                .arg(format!("template/{}", branch))
-                .output()
-                .await
-                .context("resolving template branch")?;
-            if output.status.success() {
-                return update_upstream_ref(student_repo, &format!("template/{}", branch)).await;
-            }
+    }
+    for branch in [Config::DEFAULT_BRANCH, "master"] {
+        if git_ref_exists(template_path, &format!("refs/heads/{branch}")).await? {
+            return Ok(branch.to_string());
         }
-        anyhow::bail!("could not determine template default branch");
-    };
-
-    update_upstream_ref(student_repo, &upstream_ref).await
+    }
+    anyhow::bail!("could not determine template default branch");
 }
 
 async fn update_upstream_ref(student_repo: &std::path::Path, src_ref: &str) -> Result<()> {

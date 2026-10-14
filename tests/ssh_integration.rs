@@ -509,6 +509,297 @@ async fn test_classroom_git_round_trip() -> Result<()> {
         "legacy client clone is missing the student's answer.txt"
     );
 
+    // A first push that introduces a single differently named branch is
+    // adopted as the template's default branch, so clones check out real
+    // content instead of a dangling HEAD.
+    run_ssh(
+        port,
+        &teacher_key,
+        &["classroom", "add-template", "cs101", "lab2"],
+    )
+    .await?;
+
+    let teacher_lab2 = data_dir.join("teacher-lab2");
+    let mut clone = Command::new("git");
+    clone
+        .env("GIT_SSH_COMMAND", &teacher_ssh)
+        .arg("clone")
+        .arg(repo_url(port, "cs101", "lab2"))
+        .arg(&teacher_lab2)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = clone.output().await.context("teacher cloning lab2")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "teacher lab2 clone failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut checkout = Command::new("git");
+    checkout
+        .arg("-C")
+        .arg(&teacher_lab2)
+        .arg("checkout")
+        .arg("-b")
+        .arg("solution");
+    let output = checkout.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "teacher checkout -b solution failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    tokio::fs::write(teacher_lab2.join("SOL.md"), "solution material\n").await?;
+
+    let mut add = Command::new("git");
+    add.arg("-C").arg(&teacher_lab2).arg("add").arg(".");
+    let output = add.output().await?;
+    anyhow::ensure!(output.status.success(), "teacher lab2 git add failed");
+
+    let mut commit = Command::new("git");
+    commit
+        .arg("-C")
+        .arg(&teacher_lab2)
+        .arg("commit")
+        .arg("-m")
+        .arg("solution");
+    let output = commit.output().await?;
+    anyhow::ensure!(output.status.success(), "teacher lab2 git commit failed");
+
+    let mut push = Command::new("git");
+    push.env("GIT_SSH_COMMAND", &teacher_ssh)
+        .arg("-C")
+        .arg(&teacher_lab2)
+        .arg("push")
+        .arg("origin")
+        .arg("solution");
+    let output = push.output().await.context("pushing solution branch")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "teacher push solution failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A fresh clone checks out the adopted branch.
+    let lab2_fresh = data_dir.join("lab2-fresh");
+    let mut clone = Command::new("git");
+    clone
+        .env("GIT_SSH_COMMAND", &teacher_ssh)
+        .arg("clone")
+        .arg(repo_url(port, "cs101", "lab2"))
+        .arg(&lab2_fresh)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = clone.output().await.context("fresh clone of lab2")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "fresh lab2 clone failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut branch = Command::new("git");
+    branch
+        .arg("-C")
+        .arg(&lab2_fresh)
+        .arg("branch")
+        .arg("--show-current");
+    let output = branch.output().await?;
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "solution",
+        "fresh lab2 clone did not check out the adopted branch"
+    );
+    anyhow::ensure!(
+        lab2_fresh.join("SOL.md").is_file(),
+        "fresh lab2 clone is missing SOL.md"
+    );
+
+    // set-default-branch refuses a branch that does not exist, and is not
+    // available to students.
+    let output = ssh_cmd(
+        port,
+        &teacher_key,
+        &["classroom", "set-default-branch", "cs101", "lab2", "main"],
+    )
+    .output()
+    .await?;
+    anyhow::ensure!(
+        !output.status.success(),
+        "set-default-branch succeeded for a nonexistent branch"
+    );
+
+    let output = ssh_cmd(
+        port,
+        &student_key,
+        &[
+            "classroom",
+            "set-default-branch",
+            "cs101",
+            "lab2",
+            "solution",
+        ],
+    )
+    .output()
+    .await?;
+    anyhow::ensure!(
+        !output.status.success(),
+        "student set-default-branch succeeded"
+    );
+
+    // Alice clones lab2; her upstream branch tracks the template's default.
+    let alice_lab2 = data_dir.join("alice-lab2");
+    let mut clone = Command::new("git");
+    clone
+        .env("GIT_SSH_COMMAND", git_ssh_command(&student_key, port))
+        .arg("clone")
+        .arg(repo_url(port, "cs101", "lab2"))
+        .arg(&alice_lab2)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = clone.output().await.context("alice cloning lab2")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "alice lab2 clone failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The teacher pushes main and promotes it to the default branch.
+    let mut checkout = Command::new("git");
+    checkout
+        .arg("-C")
+        .arg(&teacher_lab2)
+        .arg("checkout")
+        .arg("-b")
+        .arg("main");
+    let output = checkout.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "teacher checkout -b main failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    tokio::fs::write(teacher_lab2.join("MAIN.md"), "main material\n").await?;
+
+    let mut add = Command::new("git");
+    add.arg("-C").arg(&teacher_lab2).arg("add").arg(".");
+    let output = add.output().await?;
+    anyhow::ensure!(output.status.success(), "teacher lab2 git add failed");
+
+    let mut commit = Command::new("git");
+    commit
+        .arg("-C")
+        .arg(&teacher_lab2)
+        .arg("commit")
+        .arg("-m")
+        .arg("main");
+    let output = commit.output().await?;
+    anyhow::ensure!(output.status.success(), "teacher lab2 git commit failed");
+
+    let mut push = Command::new("git");
+    push.env("GIT_SSH_COMMAND", &teacher_ssh)
+        .arg("-C")
+        .arg(&teacher_lab2)
+        .arg("push")
+        .arg("origin")
+        .arg("main");
+    let output = push.output().await.context("pushing main branch")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "teacher push main failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    run_ssh(
+        port,
+        &teacher_key,
+        &["classroom", "set-default-branch", "cs101", "lab2", "main"],
+    )
+    .await?;
+
+    // Alice's upstream branch follows the switch, even though main and
+    // solution have diverged: upstream resets to the new default branch tip.
+    let mut rev_parse = Command::new("git");
+    rev_parse
+        .arg("-C")
+        .arg(&teacher_lab2)
+        .arg("rev-parse")
+        .arg("main");
+    let output = rev_parse.output().await?;
+    anyhow::ensure!(output.status.success(), "resolving teacher main failed");
+    let main_tip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let mut fetch = Command::new("git");
+    fetch
+        .env("GIT_SSH_COMMAND", git_ssh_command(&student_key, port))
+        .arg("-C")
+        .arg(&alice_lab2)
+        .arg("fetch")
+        .arg("origin");
+    let output = fetch.output().await.context("alice lab2 fetch")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "alice lab2 fetch failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut rev_parse = Command::new("git");
+    rev_parse
+        .arg("-C")
+        .arg(&alice_lab2)
+        .arg("rev-parse")
+        .arg("origin/upstream");
+    let output = rev_parse.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "resolving alice's origin/upstream failed"
+    );
+    let upstream_tip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(
+        upstream_tip, main_tip,
+        "alice's upstream branch did not follow the default-branch switch"
+    );
+
+    // Fresh clones check out the new default branch.
+    let lab2_fresh2 = data_dir.join("lab2-fresh2");
+    let mut clone = Command::new("git");
+    clone
+        .env("GIT_SSH_COMMAND", &teacher_ssh)
+        .arg("clone")
+        .arg(repo_url(port, "cs101", "lab2"))
+        .arg(&lab2_fresh2)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = clone.output().await.context("fresh clone of lab2")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "fresh lab2 clone failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut branch = Command::new("git");
+    branch
+        .arg("-C")
+        .arg(&lab2_fresh2)
+        .arg("branch")
+        .arg("--show-current");
+    let output = branch.output().await?;
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "main",
+        "fresh lab2 clone did not check out the new default branch"
+    );
+    anyhow::ensure!(
+        lab2_fresh2.join("MAIN.md").is_file(),
+        "fresh lab2 clone is missing MAIN.md"
+    );
+
     // Teacher downloads an archive of active student repos.
     let mut download = ssh_cmd(
         port,
