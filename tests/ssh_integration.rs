@@ -862,12 +862,39 @@ async fn test_classroom_git_round_trip() -> Result<()> {
     )
     .await?;
 
-    // Listing should show both students as inactive now.
+    // Invariants: a teacher cannot demote themselves by re-registering with a
+    // student token, and the last active teacher cannot be deactivated. (OpenSSH
+    // does not relay remote stderr for a failed exec request; the error text
+    // itself is covered by the db unit tests.)
+    let output = ssh_cmd(port, &teacher_key, &["register", token, "Teacher"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        !output.status.success(),
+        "teacher re-registered with a student token"
+    );
+
+    let teacher = find_user_by_sanitized_name(&conn, "Teacher")?.context("teacher not found")?;
+    let output = ssh_cmd(
+        port,
+        &teacher_key,
+        &["classroom", "deactivate", "cs101", &teacher.id.to_string()],
+    )
+    .output()
+    .await?;
+    anyhow::ensure!(!output.status.success(), "teacher deactivated themselves");
+
+    // Listing should show both students as inactive and the teacher intact.
     let (list_out, _) = run_ssh(port, &teacher_key, &["classroom", "list", "cs101"]).await?;
     assert_eq!(
         list_out.matches("active: no").count(),
         2,
         "deactivated students not reflected in listing: {}",
+        list_out
+    );
+    assert!(
+        list_out.contains("role: teacher, active: yes"),
+        "teacher no longer active after self-demotion attempt: {}",
         list_out
     );
 

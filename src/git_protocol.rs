@@ -925,8 +925,12 @@ async fn classroom_deactivate(
         return Ok(());
     }
 
-    set_membership_active(&conn, classroom.id, user_id, false)
-        .context("deactivating membership")?;
+    if let Err(e) = set_membership_active(&conn, classroom.id, user_id, false) {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(&ctx, &format!("{:#}\n", e)).await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
 
     ctx.handle
         .channel_success(ctx.channel_id)

@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rand::Rng;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -17,6 +17,16 @@ impl Role {
             Role::Teacher => "teacher",
             Role::Ta => "ta",
             Role::Student => "student",
+        }
+    }
+
+    /// Promotion rank: a member's role in a classroom can only be raised,
+    /// never lowered (student < ta < teacher).
+    pub fn rank(&self) -> u8 {
+        match self {
+            Role::Teacher => 3,
+            Role::Ta => 2,
+            Role::Student => 1,
         }
     }
 }
@@ -390,6 +400,37 @@ pub fn set_membership_active(
     user_id: i64,
     active: bool,
 ) -> Result<usize> {
+    if !active {
+        // Deactivating the last active teacher would leave the classroom
+        // without anyone able to manage it; refuse.
+        let target: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT role, active
+                 FROM classroom_memberships
+                 WHERE classroom_id = ?1 AND user_id = ?2",
+                (classroom_id, user_id),
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("loading membership")?;
+        if let Some((role, active_flag)) = target
+            && role == "teacher"
+            && active_flag == 1
+        {
+            let teachers: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM classroom_memberships
+                     WHERE classroom_id = ?1 AND active = 1 AND role = 'teacher'",
+                    [classroom_id],
+                    |row| row.get(0),
+                )
+                .context("counting active teachers")?;
+            if teachers <= 1 {
+                anyhow::bail!("cannot deactivate the last active teacher of this classroom");
+            }
+        }
+    }
     let rows = conn
         .execute(
             "UPDATE classroom_memberships SET active = ?1
@@ -683,30 +724,108 @@ pub fn consume_classroom_invite_token(
         }
     };
 
-    // Create or replace membership.
+    // Create or update the membership. Roles are monotonic: re-registering
+    // can only promote (student -> ta -> teacher), never demote. Registering
+    // with a lower role than the current active membership is rejected so an
+    // accidental re-registration cannot strip someone's rank.
+    let existing_membership: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT role, active
+             FROM classroom_memberships
+             WHERE user_id = ?1 AND classroom_id = ?2",
+            (user.id, classroom_id),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("loading existing membership")?;
+
+    let resulting_role = match &existing_membership {
+        Some((current_role, active)) => {
+            let current: Role = current_role
+                .parse()
+                .context("invalid role in existing membership")?;
+            if *active == 1 && role.rank() < current.rank() {
+                anyhow::bail!(
+                    "cannot register as {}: already registered in this classroom as {} (roles can only be promoted, not demoted)",
+                    role.as_str(),
+                    current.as_str()
+                );
+            }
+            if current.rank() >= role.rank() {
+                current
+            } else {
+                role
+            }
+        }
+        None => role,
+    };
+
+    // Guard: no action may leave a classroom that has an active teacher
+    // without one. Registration cannot lower roles, so this cannot trigger
+    // today; it protects the invariant for future changes to this path.
+    let teachers_before = count_active_teachers(&tx, classroom_id)?;
+
     tx.execute(
         "INSERT INTO classroom_memberships (user_id, classroom_id, role, active, created_at)
          VALUES (?1, ?2, ?3, 1, ?4)
          ON CONFLICT(user_id, classroom_id)
          DO UPDATE SET role = excluded.role, active = 1, created_at = excluded.created_at",
-        (user.id, classroom_id, role.as_str(), now),
+        (user.id, classroom_id, resulting_role.as_str(), now),
     )
     .context("inserting classroom membership")?;
 
-    let membership_id = tx.last_insert_rowid();
+    let teachers_after = count_active_teachers(&tx, classroom_id)?;
+    if teachers_before > 0 && teachers_after == 0 {
+        anyhow::bail!("this registration would leave the classroom without an active teacher");
+    }
+
+    let membership_row = tx
+        .query_row(
+            "SELECT id, user_id, classroom_id, role, active, created_at
+             FROM classroom_memberships
+             WHERE user_id = ?1 AND classroom_id = ?2",
+            (user.id, classroom_id),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .context("loading membership")?
+        .context("membership missing after registration")?;
+
+    let membership = ClassroomMembership {
+        id: membership_row.0,
+        user_id: membership_row.1,
+        classroom_id: membership_row.2,
+        role: membership_row
+            .3
+            .parse()
+            .context("invalid role in membership")?,
+        active: membership_row.4 == 1,
+        created_at: membership_row.5,
+    };
 
     tx.commit().context("committing registration")?;
 
-    let membership = ClassroomMembership {
-        id: membership_id,
-        user_id: user.id,
-        classroom_id,
-        role,
-        active: true,
-        created_at: now,
-    };
-
     Ok((user, membership))
+}
+
+fn count_active_teachers(tx: &Transaction, classroom_id: i64) -> Result<i64> {
+    tx.query_row(
+        "SELECT COUNT(*)
+         FROM classroom_memberships
+         WHERE classroom_id = ?1 AND active = 1 AND role = 'teacher'",
+        [classroom_id],
+        |row| row.get(0),
+    )
+    .context("counting active teachers")
 }
 
 pub fn parse_public_key(key_text: &str) -> Result<russh::keys::ssh_key::PublicKey> {
@@ -874,5 +993,153 @@ mod tests {
 
         let user_memberships = list_user_memberships(&conn, student.id, false).unwrap();
         assert_eq!(user_memberships.len(), 2);
+    }
+
+    #[test]
+    fn test_role_promotion_is_monotonic() {
+        let mut conn = in_memory_conn();
+        init_db(&conn).unwrap();
+
+        let teacher_id = add_user(&conn, "Alice", sample_key()).unwrap();
+        let classroom = create_classroom(&mut conn, "cs101", "CS 101", teacher_id).unwrap();
+
+        let student_token =
+            create_classroom_invite_token(&conn, classroom.id, Role::Student).unwrap();
+        let ta_token = create_classroom_invite_token(&conn, classroom.id, Role::Ta).unwrap();
+        let teacher_token =
+            create_classroom_invite_token(&conn, classroom.id, Role::Teacher).unwrap();
+
+        // A teacher cannot re-register as a student.
+        let err = consume_classroom_invite_token(
+            &mut conn,
+            &student_token,
+            Some("Alice"),
+            Some(sample_key()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot register as student"),
+            "unexpected error: {:#}",
+            err
+        );
+        let membership = find_classroom_membership(&conn, teacher_id, classroom.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(membership.role, Role::Teacher);
+
+        // Promotion student -> ta -> teacher works.
+        let (bob, membership) = consume_classroom_invite_token(
+            &mut conn,
+            &student_token,
+            Some("Bob"),
+            Some(sample_key_2()),
+        )
+        .unwrap();
+        assert_eq!(membership.role, Role::Student);
+
+        let (_, membership) =
+            consume_classroom_invite_token(&mut conn, &ta_token, Some("Bob"), Some(sample_key_2()))
+                .unwrap();
+        assert_eq!(membership.role, Role::Ta);
+        assert!(membership.active);
+
+        let (_, membership) = consume_classroom_invite_token(
+            &mut conn,
+            &teacher_token,
+            Some("Bob"),
+            Some(sample_key_2()),
+        )
+        .unwrap();
+        assert_eq!(membership.role, Role::Teacher);
+
+        // ...and a student token no longer demotes afterwards.
+        let err = consume_classroom_invite_token(
+            &mut conn,
+            &student_token,
+            Some("Bob"),
+            Some(sample_key_2()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot register as student"),
+            "unexpected error: {:#}",
+            err
+        );
+        let membership = find_classroom_membership(&conn, bob.id, classroom.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(membership.role, Role::Teacher);
+    }
+
+    #[test]
+    fn test_reactivation_never_demotes() {
+        let mut conn = in_memory_conn();
+        init_db(&conn).unwrap();
+
+        let alice_id = add_user(&conn, "Alice", sample_key()).unwrap();
+        let classroom = create_classroom(&mut conn, "cs101", "CS 101", alice_id).unwrap();
+
+        let teacher_token =
+            create_classroom_invite_token(&conn, classroom.id, Role::Teacher).unwrap();
+        let student_token =
+            create_classroom_invite_token(&conn, classroom.id, Role::Student).unwrap();
+
+        let (bob, _) = consume_classroom_invite_token(
+            &mut conn,
+            &teacher_token,
+            Some("Bob"),
+            Some(sample_key_2()),
+        )
+        .unwrap();
+        set_membership_active(&conn, classroom.id, bob.id, false).unwrap();
+
+        // Bob re-registers with a student token: he is reactivated, and the
+        // monotonic role rule keeps him a teacher.
+        let (_, membership) = consume_classroom_invite_token(
+            &mut conn,
+            &student_token,
+            Some("Bob"),
+            Some(sample_key_2()),
+        )
+        .unwrap();
+        assert_eq!(membership.role, Role::Teacher);
+        assert!(membership.active);
+    }
+
+    #[test]
+    fn test_cannot_deactivate_last_active_teacher() {
+        let mut conn = in_memory_conn();
+        init_db(&conn).unwrap();
+
+        let alice_id = add_user(&conn, "Alice", sample_key()).unwrap();
+        let classroom = create_classroom(&mut conn, "cs101", "CS 101", alice_id).unwrap();
+
+        // The only teacher cannot be deactivated.
+        let err = set_membership_active(&conn, classroom.id, alice_id, false).unwrap_err();
+        assert!(
+            err.to_string().contains("last active teacher"),
+            "unexpected error: {:#}",
+            err
+        );
+
+        // With a second teacher, the first may step down; then the second is
+        // the last active teacher and cannot be deactivated either.
+        let teacher_token =
+            create_classroom_invite_token(&conn, classroom.id, Role::Teacher).unwrap();
+        let (bob, _) = consume_classroom_invite_token(
+            &mut conn,
+            &teacher_token,
+            Some("Bob"),
+            Some(sample_key_2()),
+        )
+        .unwrap();
+        set_membership_active(&conn, classroom.id, alice_id, false).unwrap();
+
+        let err = set_membership_active(&conn, classroom.id, bob.id, false).unwrap_err();
+        assert!(
+            err.to_string().contains("last active teacher"),
+            "unexpected error: {:#}",
+            err
+        );
     }
 }
