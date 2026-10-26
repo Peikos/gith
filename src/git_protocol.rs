@@ -365,6 +365,87 @@ async fn run_git_command(
     Ok(())
 }
 
+/// Validate a user-supplied display name at registration. Names are stored
+/// verbatim and embedded in archive entry names by `classroom download`, so
+/// characters that are unsafe in paths or markup are rejected.
+fn validate_display_name(name: &str) -> Result<()> {
+    if name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | '/' | '\\'))
+    {
+        anyhow::bail!(
+            "name contains invalid characters: <, >, /, \\ and control characters are not allowed"
+        );
+    }
+    Ok(())
+}
+
+/// Validate a value used as a single filesystem path segment (classroom slug,
+/// template repository name). Rejects absolute paths and traversal: joining
+/// an absolute segment onto a base path would escape the data directory.
+fn validate_path_segment(value: &str, what: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains(' ')
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(|c| c.is_control())
+    {
+        anyhow::bail!(
+            "invalid {}: must be a single path segment without spaces, '/', '\\' or '..'",
+            what
+        );
+    }
+    Ok(())
+}
+
+/// Make a student-provided name safe and readable for use as an archive
+/// entry name in `classroom download`: the name is transliterated to ASCII
+/// (`deunicode`, so e.g. `Önder Yılmaz` becomes `Onder Yilmaz`), whitespace
+/// is removed (preserving the historical entry names), and every remaining
+/// character outside [A-Za-z0-9._-] maps to '_'. Guards against path
+/// traversal via crafted display names, independent of what is stored in
+/// the database.
+fn sanitize_entry_name(name: &str) -> String {
+    deunicode::deunicode(name)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Assign archive entry names for one download batch, disambiguating
+/// collisions (e.g. `Omer` and `Ömer` transliterate to the same entry name)
+/// with a stable `-<user id>` suffix. Without this, duplicate entry names
+/// would silently overwrite each other on extraction.
+fn assign_entry_names(students: &[(i64, String)]) -> Vec<String> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    students
+        .iter()
+        .map(|(id, name)| {
+            let base = sanitize_entry_name(name);
+            let mut entry = base.clone();
+            if used.contains(&entry) {
+                entry = format!("{base}-{id}");
+            }
+            let mut suffix = 2;
+            while used.contains(&entry) {
+                entry = format!("{base}-{id}-{suffix}");
+                suffix += 1;
+            }
+            used.insert(entry.clone());
+            entry
+        })
+        .collect()
+}
+
 async fn handle_register(
     parts: Vec<String>,
     channel: Channel<russh::server::Msg>,
@@ -382,6 +463,13 @@ async fn handle_register(
         send_exit(&ctx, 1).await?;
         return Ok(());
     };
+
+    if let Err(e) = validate_display_name(name) {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(&ctx, &format!("{:#}\n", e)).await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
 
     let Some(ref key) = ctx.public_key else {
         let _ = ctx.handle.channel_failure(ctx.channel_id).await;
@@ -532,9 +620,9 @@ async fn classroom_create(
     let slug = &parts[2];
     let name = parts[3..].join(" ");
 
-    if slug.contains(' ') {
+    if let Err(e) = validate_path_segment(slug, "classroom slug") {
         let _ = ctx.handle.channel_failure(ctx.channel_id).await;
-        send_stderr(&ctx, "classroom slug cannot contain spaces\n").await?;
+        send_stderr(&ctx, &format!("{:#}\n", e)).await?;
         send_exit(&ctx, 1).await?;
         return Ok(());
     }
@@ -654,6 +742,13 @@ async fn classroom_add_template(
     let slug = &parts[2];
     let repo_name = &parts[3];
 
+    if let Err(e) = validate_path_segment(repo_name, "template name") {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(&ctx, &format!("{:#}\n", e)).await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
+
     let Some(ref user) = ctx.authenticated_user else {
         let _ = ctx.handle.channel_failure(ctx.channel_id).await;
         send_stderr(&ctx, "classroom add-template requires registration\n").await?;
@@ -720,6 +815,13 @@ async fn classroom_set_default_branch(
 
     let slug = &parts[2];
     let repo_name = &parts[3];
+
+    if let Err(e) = validate_path_segment(repo_name, "template name") {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(&ctx, &format!("{:#}\n", e)).await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
     let branch = &parts[4];
 
     let Some(ref user) = ctx.authenticated_user else {
@@ -959,6 +1061,13 @@ async fn classroom_download(
     let slug = &parts[2];
     let repo_name = &parts[3];
 
+    if let Err(e) = validate_path_segment(repo_name, "template name") {
+        let _ = ctx.handle.channel_failure(ctx.channel_id).await;
+        send_stderr(&ctx, &format!("{:#}\n", e)).await?;
+        send_exit(&ctx, 1).await?;
+        return Ok(());
+    }
+
     let Some(ref user) = ctx.authenticated_user else {
         let _ = ctx.handle.channel_failure(ctx.channel_id).await;
         send_stderr(&ctx, "classroom download requires registration\n").await?;
@@ -1004,12 +1113,21 @@ async fn classroom_download(
         .join(repo_name)
         .join("students");
 
-    // Only include students whose repositories actually exist.
+    // Only include students whose repositories actually exist. Entry names
+    // are assigned for the whole batch first so transliterated collisions
+    // (Omer vs Ömer) are disambiguated even when a colliding student has no
+    // repository.
+    let entry_names = assign_entry_names(
+        &active_students
+            .iter()
+            .map(|u| (u.id, u.name.clone()))
+            .collect::<Vec<_>>(),
+    );
     let mut archive_entries: Vec<(std::path::PathBuf, String)> = Vec::new();
-    for student in &active_students {
+    for (student, entry_name) in active_students.iter().zip(entry_names.iter()) {
         let repo_path = students_dir.join(format!("{}.git", student.id));
         if repo_path.is_dir() {
-            archive_entries.push((repo_path, student.name.replace(' ', "")));
+            archive_entries.push((repo_path, entry_name.clone()));
         } else {
             info!(
                 "skipping student {} (id {}): repo {:?} does not exist",
@@ -1407,4 +1525,65 @@ async fn send_exit(ctx: &CommandContext, code: u32) -> Result<()> {
     let _ = ctx.handle.eof(ctx.channel_id).await;
     let _ = ctx.handle.close(ctx.channel_id).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_entry_name() {
+        assert_eq!(sanitize_entry_name("Alice Smith"), "AliceSmith");
+        assert_eq!(sanitize_entry_name("<name>"), "_name_");
+        assert_eq!(
+            sanitize_entry_name("../../etc/passwd x"),
+            ".._.._etc_passwdx"
+        );
+        assert_eq!(sanitize_entry_name("/abs/path"), "_abs_path");
+        // Transliteration keeps non-ASCII names readable.
+        assert_eq!(sanitize_entry_name("Dönüştürme"), "Donusturme");
+        assert_eq!(sanitize_entry_name("Önder Yılmaz"), "OnderYilmaz");
+        assert_eq!(sanitize_entry_name("François"), "Francois");
+    }
+
+    #[test]
+    fn test_assign_entry_names() {
+        let names =
+            assign_entry_names(&[(1, "Alice Smith".to_string()), (2, "Bob Smith".to_string())]);
+        assert_eq!(names, vec!["AliceSmith", "BobSmith"]);
+
+        // Transliterated duplicates are disambiguated with the user id.
+        let names = assign_entry_names(&[
+            (1, "Omer Yilmaz".to_string()),
+            (2, "Ömer Yılmaz".to_string()),
+        ]);
+        assert_eq!(names, vec!["OmerYilmaz", "OmerYilmaz-2"]);
+
+        // Disambiguation is deterministic regardless of input order.
+        let names = assign_entry_names(&[
+            (2, "Ömer Yılmaz".to_string()),
+            (1, "Omer Yilmaz".to_string()),
+        ]);
+        assert_eq!(names, vec!["OmerYilmaz", "OmerYilmaz-1"]);
+    }
+
+    #[test]
+    fn test_validate_display_name() {
+        assert!(validate_display_name("Alice O'Neil-van Dijk").is_ok());
+        assert!(validate_display_name("<name>").is_err());
+        assert!(validate_display_name("a/b").is_err());
+        assert!(validate_display_name("a\\b").is_err());
+        assert!(validate_display_name("bad\nname").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_segment() {
+        assert!(validate_path_segment("cs101", "slug").is_ok());
+        assert!(validate_path_segment("lab1", "template name").is_ok());
+        assert!(validate_path_segment("a/b", "template name").is_err());
+        assert!(validate_path_segment("/abs", "slug").is_err());
+        assert!(validate_path_segment("..", "slug").is_err());
+        assert!(validate_path_segment("a b", "slug").is_err());
+        assert!(validate_path_segment("", "slug").is_err());
+    }
 }

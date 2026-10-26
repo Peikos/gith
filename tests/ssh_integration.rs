@@ -234,6 +234,8 @@ async fn test_classroom_git_round_trip() -> Result<()> {
     generate_key(&student_key)?;
     let student2_key = data_dir.join("student2_key");
     generate_key(&student2_key)?;
+    let student3_key = data_dir.join("student3_key");
+    generate_key(&student3_key)?;
 
     // Start server.
     let (_server_handle, port) = start_server(config).await?;
@@ -883,6 +885,46 @@ async fn test_classroom_git_round_trip() -> Result<()> {
     .output()
     .await?;
     anyhow::ensure!(!output.status.success(), "teacher deactivated themselves");
+
+    // Input validation: unsafe display names and path segments are rejected.
+    let output = ssh_cmd(port, &teacher_key, &["register", token, "<name>"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        !output.status.success(),
+        "registered a display name with invalid characters"
+    );
+
+    let output = ssh_cmd(
+        port,
+        &teacher_key,
+        &["classroom", "create", "evil/slug", "X"],
+    )
+    .output()
+    .await?;
+    anyhow::ensure!(
+        !output.status.success(),
+        "created a classroom with a bad slug"
+    );
+
+    let output = ssh_cmd(
+        port,
+        &teacher_key,
+        &["classroom", "add-template", "cs101", "a/b"],
+    )
+    .output()
+    .await?;
+    anyhow::ensure!(!output.status.success(), "added a template with a bad name");
+
+    // Names are distinguished ignoring spaces: "AliceSmith" collides with
+    // the registered "Alice Smith" and must be rejected.
+    let output = ssh_cmd(port, &student3_key, &["register", token, "AliceSmith"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        !output.status.success(),
+        "registered a name colliding ignoring spaces"
+    );
 
     // Listing should show both students as inactive and the teacher intact.
     let (list_out, _) = run_ssh(port, &teacher_key, &["classroom", "list", "cs101"]).await?;

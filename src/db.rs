@@ -142,6 +142,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ",
     )
     .context("creating database schema")?;
+    run_migrations(conn)?;
+    Ok(())
+}
+
+/// Early versions accepted unvalidated display names, so some users are literally named
+/// "<name>" (a copy-paste of the example instructions). Strip the carets; on the (verified
+/// absent) chance of a unique-name collision, skip the cleanup and keep running. Consumers
+/// of the data also sanitize defensively.
+
+fn run_migrations(conn: &Connection) -> Result<()> {
+    if let Err(e) = conn.execute(
+        "UPDATE users SET name = replace(replace(name, '<', ''), '>', '')
+         WHERE instr(name, '<') > 0 OR instr(name, '>') > 0",
+        [],
+    ) {
+        tracing::warn!("could not strip caret characters from user names: {}", e);
+    }
     Ok(())
 }
 
@@ -697,6 +714,12 @@ pub fn consume_classroom_invite_token(
             if let Some(new_name) = name
                 && new_name != existing.name
             {
+                if sanitized_name_taken(&tx, new_name, existing.id)? {
+                    anyhow::bail!(
+                        "the name '{}' is already taken (names are distinguished ignoring spaces); please add a middle name or initial",
+                        new_name
+                    );
+                }
                 tx.execute(
                     "UPDATE users SET name = ?1 WHERE id = ?2",
                     (new_name, existing.id),
@@ -707,6 +730,12 @@ pub fn consume_classroom_invite_token(
         }
         None => {
             let user_name = name.unwrap_or("Unnamed");
+            if sanitized_name_taken(&tx, user_name, -1)? {
+                anyhow::bail!(
+                    "the name '{}' is already taken (names are distinguished ignoring spaces); please add a middle name or initial",
+                    user_name
+                );
+            }
             tx.execute(
                 "INSERT INTO users (name, ssh_public_key, key_fingerprint, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -826,6 +855,22 @@ fn count_active_teachers(tx: &Transaction, classroom_id: i64) -> Result<i64> {
         |row| row.get(0),
     )
     .context("counting active teachers")
+}
+
+/// Whether another user already occupies the space-insensitive form of
+/// `name` (matching the generated `name_sanitized` column, which is UNIQUE).
+fn sanitized_name_taken(tx: &Transaction, name: &str, exclude_user_id: i64) -> Result<bool> {
+    tx.query_row(
+        "SELECT 1
+         FROM users
+         WHERE name_sanitized = replace(?1, ' ', '') AND id != ?2
+         LIMIT 1",
+        (name, exclude_user_id),
+        |_| Ok(()),
+    )
+    .optional()
+    .context("checking name availability")
+    .map(|row| row.is_some())
 }
 
 pub fn parse_public_key(key_text: &str) -> Result<russh::keys::ssh_key::PublicKey> {
@@ -1141,5 +1186,64 @@ mod tests {
             "unexpected error: {:#}",
             err
         );
+    }
+
+    #[test]
+    fn test_migration_strips_carets_from_names() {
+        let conn = in_memory_conn();
+        init_db(&conn).unwrap();
+        let id = add_user(&conn, "placeholder", sample_key()).unwrap();
+
+        // Simulate a legacy user created before display-name validation
+        // existed (a copy-paste of the example instructions).
+        conn.execute("UPDATE users SET name = '<name>' WHERE id = ?1", [id])
+            .unwrap();
+
+        // init_db runs the migrations on every call; they are idempotent.
+        init_db(&conn).unwrap();
+        let user = find_user_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(user.name, "name");
+
+        init_db(&conn).unwrap();
+        let user = find_user_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(user.name, "name");
+    }
+
+    #[test]
+    fn test_registration_rejects_space_insensitive_name_collision() {
+        let mut conn = in_memory_conn();
+        init_db(&conn).unwrap();
+
+        let teacher_id = add_user(&conn, "Alice", sample_key()).unwrap();
+        let classroom = create_classroom(&mut conn, "cs101", "CS 101", teacher_id).unwrap();
+        let token = create_classroom_invite_token(&conn, classroom.id, Role::Student).unwrap();
+
+        let (_, membership) = consume_classroom_invite_token(
+            &mut conn,
+            &token,
+            Some("Bob Smith"),
+            Some(sample_key_2()),
+        )
+        .unwrap();
+        assert_eq!(membership.role, Role::Student);
+
+        // "BobSmith" collides with the existing "Bob Smith" once spaces are
+        // ignored; registration must be rejected with a readable error.
+        let err = consume_classroom_invite_token(
+            &mut conn,
+            &token,
+            Some("BobSmith"),
+            Some(sample_key_3()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("already taken"),
+            "unexpected error: {:#}",
+            err
+        );
+
+        // The original user is untouched.
+        let original = find_user_by_sanitized_name(&conn, "BobSmith").unwrap();
+        assert_eq!(original.map(|u| u.name), Some("Bob Smith".to_string()));
     }
 }
