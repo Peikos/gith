@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use russh::server::Handle;
@@ -14,6 +15,10 @@ use crate::db::{
     find_classroom_template, find_user_by_sanitized_name, list_classroom_memberships,
     list_classroom_templates, list_user_memberships, open_db, set_membership_active,
 };
+
+/// Uniquifier for temporary export directories, so concurrent downloads in
+/// one server process never collide on the same path.
+static EXPORT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 pub struct CommandContext {
@@ -1123,11 +1128,11 @@ async fn classroom_download(
             .map(|u| (u.id, u.name.clone()))
             .collect::<Vec<_>>(),
     );
-    let mut archive_entries: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut archive_entries: Vec<(std::path::PathBuf, String, i64)> = Vec::new();
     for (student, entry_name) in active_students.iter().zip(entry_names.iter()) {
         let repo_path = students_dir.join(format!("{}.git", student.id));
         if repo_path.is_dir() {
-            archive_entries.push((repo_path, entry_name.clone()));
+            archive_entries.push((repo_path, entry_name.clone(), student.id));
         } else {
             info!(
                 "skipping student {} (id {}): repo {:?} does not exist",
@@ -1161,7 +1166,7 @@ async fn classroom_download_send(
     repo_name: String,
     mut channel: Channel<russh::server::Msg>,
     ctx: CommandContext,
-    archive_entries: Vec<(std::path::PathBuf, String)>,
+    archive_entries: Vec<(std::path::PathBuf, String, i64)>,
 ) -> Result<()> {
     ctx.handle
         .channel_success(ctx.channel_id)
@@ -1174,15 +1179,89 @@ async fn classroom_download_send(
         archive_entries.len()
     );
 
+    // Give exported checkouts an `origin` pointing at the canonical server
+    // URL so teachers can fetch updates after a feedback round. When no base
+    // URL is configured or detectable, remove the remote instead of leaving
+    // a server-internal path in the archive.
+    let base_url = ctx.config.base_url.clone();
+    let slug_for_origin = slug.clone();
+    let repo_name_for_origin = repo_name.clone();
+
     let archive = match tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         {
             let encoder = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
             let mut builder = tar::Builder::new(encoder);
-            for (repo_path, sanitized_name) in archive_entries {
-                builder
-                    .append_dir_all(format!("{}.git", sanitized_name), &repo_path)
-                    .with_context(|| format!("adding {:?} to archive", repo_path))?;
+            // Student trees may contain symlinks. Store them as links rather
+            // than following them: following a link to an absolute server
+            // path would leak that file's contents into the archive.
+            builder.follow_symlinks(false);
+            for (repo_path, entry_name, user_id) in archive_entries {
+                // Export a checkout at the current HEAD instead of archiving
+                // the bare repository: `git clone` handles empty repositories
+                // gracefully (no checkout). The clone keeps its `.git`
+                // directory so teachers can inspect commit history for
+                // grading and feedback.
+                let unique = EXPORT_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let tmp = std::env::temp_dir().join(format!(
+                    "gith-export-{}-{}",
+                    std::process::id(),
+                    unique
+                ));
+                let _ = std::fs::remove_dir_all(&tmp);
+                let origin_url = base_url
+                    .as_ref()
+                    .map(|b| format!("{b}/{slug_for_origin}/{repo_name_for_origin}/{user_id}.git"));
+                let clone = std::process::Command::new("git")
+                    .arg("clone")
+                    .arg("--quiet")
+                    .arg(&repo_path)
+                    .arg(&tmp)
+                    .output()
+                    .with_context(|| format!("exporting {:?}", repo_path));
+                match clone {
+                    Ok(output) if output.status.success() => {
+                        let mut remote_cmd = std::process::Command::new("git");
+                        remote_cmd.arg("-C").arg(&tmp).arg("remote");
+                        match &origin_url {
+                            Some(url) => {
+                                remote_cmd.args(["set-url", "origin"]).arg(url);
+                            }
+                            None => {
+                                remote_cmd.args(["remove", "origin"]);
+                            }
+                        }
+                        match remote_cmd.output() {
+                            Ok(out) if out.status.success() => {}
+                            Ok(out) => warn!(
+                                "failed to set origin for {:?}: {}",
+                                repo_path,
+                                String::from_utf8_lossy(&out.stderr)
+                            ),
+                            Err(e) => warn!("failed to run git remote for {:?}: {}", repo_path, e),
+                        }
+                        let append = builder
+                            .append_dir_all(&entry_name, &tmp)
+                            .with_context(|| format!("adding {:?} to archive", repo_path));
+                        let cleanup = std::fs::remove_dir_all(&tmp);
+                        append?;
+                        if let Err(e) = cleanup {
+                            warn!("failed to remove temporary checkout {:?}: {}", tmp, e);
+                        }
+                    }
+                    Ok(output) => {
+                        let _ = std::fs::remove_dir_all(&tmp);
+                        anyhow::bail!(
+                            "git clone of {:?} failed: {}",
+                            repo_path,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&tmp);
+                        return Err(e);
+                    }
+                }
             }
             builder.finish().context("finalizing tar archive")?;
         }

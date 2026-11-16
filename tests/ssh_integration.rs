@@ -49,6 +49,12 @@ async fn start_server(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
+    // Configure the canonical base URL from the bound port so bulk downloads
+    // produce working origin remotes (as a production server would via
+    // --base-url / $GITH_BASE_URL / admin init).
+    let mut config = config;
+    config.set_base_url(Some(format!("127.0.0.1:{port}")));
+
     let russh_config = std::sync::Arc::new(russh::server::Config {
         inactivity_timeout: Some(Duration::from_secs(30)),
         auth_rejection_time: Duration::from_secs(1),
@@ -832,22 +838,67 @@ async fn test_classroom_git_round_trip() -> Result<()> {
     let mut stdin = child.stdin.take().unwrap();
     tokio::io::AsyncWriteExt::write_all(&mut stdin, &output.stdout).await?;
     drop(stdin);
-    let output = child.wait_with_output().await?;
+    let tz_output = child.wait_with_output().await?;
     anyhow::ensure!(
-        output.status.success(),
+        tz_output.status.success(),
         "tar tz failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&tz_output.stderr)
     );
-    let listing = String::from_utf8_lossy(&output.stdout);
+    let listing = String::from_utf8_lossy(&tz_output.stdout);
     assert!(
-        listing.contains("AliceSmith.git/"),
-        "archive listing missing Alice's repo: {}",
+        listing.contains("AliceSmith/"),
+        "archive listing missing Alice's checkout: {}",
         listing
     );
     assert!(
-        listing.contains("BobSmith.git/"),
-        "archive listing missing Bob's repo: {}",
+        listing.contains("BobSmith/"),
+        "archive listing missing Bob's checkout: {}",
         listing
+    );
+    // The entries are checkouts at the current HEAD — working tree plus
+    // commit history for grading.
+    assert!(
+        listing.contains("AliceSmith/answer.txt"),
+        "archive listing missing Alice's checked-out answer.txt: {}",
+        listing
+    );
+    assert!(
+        listing.contains("AliceSmith/.git/HEAD"),
+        "archive listing missing Alice's git history: {}",
+        listing
+    );
+
+    // The exported checkout's origin points at the canonical server URL, so
+    // teachers can fetch updates into it after a feedback round.
+    let extract_dir = data_dir.join("extract");
+    std::fs::create_dir_all(&extract_dir)?;
+    let mut untar = Command::new("tar");
+    untar
+        .arg("xzf")
+        .arg("-")
+        .arg("-C")
+        .arg(&extract_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = untar.spawn().context("spawning tar xzf")?;
+    let mut stdin = child.stdin.take().unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, &output.stdout).await?;
+    drop(stdin);
+    let untar_output = child.wait_with_output().await?;
+    anyhow::ensure!(
+        untar_output.status.success(),
+        "tar xzf failed: {}",
+        String::from_utf8_lossy(&untar_output.stderr)
+    );
+    let git_config = tokio::fs::read_to_string(extract_dir.join("AliceSmith/.git/config")).await?;
+    assert!(
+        git_config.contains(&format!(
+            "url = ssh://git@127.0.0.1:{}/cs101/lab1/{}.git",
+            port, alice.id
+        )),
+        "exported origin does not point at the canonical URL: {}",
+        git_config
     );
 
     // Teacher deactivates both students.

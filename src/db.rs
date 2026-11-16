@@ -135,6 +135,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_users_fingerprint ON users(key_fingerprint);
         CREATE INDEX IF NOT EXISTS idx_tokens_token ON classroom_invite_tokens(token);
         CREATE INDEX IF NOT EXISTS idx_memberships_user ON classroom_memberships(user_id);
@@ -150,7 +155,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 /// "<name>" (a copy-paste of the example instructions). Strip the carets; on the (verified
 /// absent) chance of a unique-name collision, skip the cleanup and keep running. Consumers
 /// of the data also sanitize defensively.
-
 fn run_migrations(conn: &Connection) -> Result<()> {
     if let Err(e) = conn.execute(
         "UPDATE users SET name = replace(replace(name, '<', ''), '>', '')
@@ -164,6 +168,26 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
 pub fn open_db(path: &std::path::Path) -> Result<Connection> {
     Connection::open(path).with_context(|| format!("opening database at {:?}", path))
+}
+
+/// Persist a server setting (see `get_setting`). Used for values configured
+/// once at init, such as the canonical base URL.
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    .context("storing setting")?;
+    Ok(())
+}
+
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        row.get(0)
+    })
+    .optional()
+    .with_context(|| format!("loading setting {}", key))
 }
 
 pub fn add_user(conn: &Connection, name: &str, ssh_public_key: &str) -> Result<i64> {
@@ -1245,5 +1269,23 @@ mod tests {
         // The original user is untouched.
         let original = find_user_by_sanitized_name(&conn, "BobSmith").unwrap();
         assert_eq!(original.map(|u| u.name), Some("Bob Smith".to_string()));
+    }
+
+    #[test]
+    fn test_settings_roundtrip() {
+        let conn = in_memory_conn();
+        init_db(&conn).unwrap();
+
+        assert!(get_setting(&conn, "base_url").unwrap().is_none());
+        set_setting(&conn, "base_url", "ssh://git@git.example.com:2222").unwrap();
+        assert_eq!(
+            get_setting(&conn, "base_url").unwrap(),
+            Some("ssh://git@git.example.com:2222".to_string())
+        );
+        set_setting(&conn, "base_url", "ssh://git@other:22").unwrap();
+        assert_eq!(
+            get_setting(&conn, "base_url").unwrap(),
+            Some("ssh://git@other:22".to_string())
+        );
     }
 }
